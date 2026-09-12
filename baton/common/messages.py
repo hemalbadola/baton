@@ -243,6 +243,9 @@ class Act(TypedDict):
     pos: int
     n: int
     dtype: str  # wire dtype, "bf16" by default (PRD 8.4)
+    # PRD 8.3's table omits `last`, but PRD 10.1 requires it: Nk applies final_norm
+    # and lm_head only "on the frame with last=true". The catalogue is incomplete.
+    last: bool
     trace: list[Any]
 
 
