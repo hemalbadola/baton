@@ -12,3 +12,4 @@ dashboard/dist/
 .shard-cache/
 bench/*.csv
 .DS_Store
+.venv/
