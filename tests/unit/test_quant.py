@@ -274,3 +274,25 @@ def test_moving_to_a_device_drops_the_packed_cache(weight):
     if Q.int4_fast_ok("cpu", torch.bfloat16):
         Q.linear(torch.randn(1, IN, dtype=torch.bfloat16), qw, fast=True)
     assert qw.to("cpu")._packed == {}
+
+
+def test_a_prefill_batch_takes_the_dequant_path(weight, monkeypatch):
+    """The kernel wins on decode and loses on prefill, so dispatch reads the batch size."""
+    calls = []
+    real = Q._int4_mm_fast
+    monkeypatch.setattr(Q, "_int4_mm_fast", lambda x, qw: calls.append(x.shape[0]) or real(x, qw))
+    qw = Q.quantize(weight, "int4")
+
+    Q.linear(torch.randn(Q.INT4_KERNEL_MAX_ROWS + 1, IN, dtype=torch.bfloat16), qw)
+    assert calls == []  # too wide for the kernel
+
+    Q.linear(torch.randn(1, IN, dtype=torch.bfloat16), qw)
+    assert calls == [1] if Q.int4_fast_ok("cpu", torch.bfloat16) else calls == []
+
+
+def test_an_explicit_fast_flag_overrides_the_batch_rule(weight):
+    if not Q.int4_fast_ok("cpu", torch.bfloat16):
+        pytest.skip("no verified int4 kernel on this backend")
+    qw = Q.quantize(weight, "int4")
+    x = torch.randn(Q.INT4_KERNEL_MAX_ROWS * 4, IN, dtype=torch.bfloat16)
+    assert Q.relative_error(Q.linear(x, qw, fast=True), Q.linear(x, qw, fast=False)) < Q.FAST_RTOL

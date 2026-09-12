@@ -42,6 +42,14 @@ EPS = 1e-8
 FAST_RTOL = 2e-2
 """How far the int4 kernel may sit from the dequant reference before we drop it."""
 
+INT4_KERNEL_MAX_ROWS = 32
+"""Above this many rows the dequant path beats the packed-int4 kernel.
+
+Measured on Apple-silicon CPU with a 4864 x 896 weight: the kernel is 15x faster
+at one row (decode) and 2.5x slower at 256 rows (a prefill chunk, PRD 10.1). The
+crossover sits near 32. Backends differ, so this is a constant, not a law.
+"""
+
 
 class QuantError(Exception):
     """A tensor cannot be quantized in the requested tier."""
@@ -364,7 +372,9 @@ def linear(
 
     if qw.tier == "int4":
         if fast is None:
-            fast = int4_fast_ok(x.device, x.dtype)
+            # The kernel wins on decode and loses on prefill. Pick by batch size.
+            rows = x.reshape(-1, x.shape[-1]).shape[0]
+            fast = rows <= INT4_KERNEL_MAX_ROWS and int4_fast_ok(x.device, x.dtype)
         if fast:
             out = _int4_mm_fast(x, qw)
             if out is not None:

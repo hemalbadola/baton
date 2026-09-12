@@ -12,3 +12,6 @@ dashboard/dist/
 .shard-cache/
 bench/*.csv
 .DS_Store
+
+# Measurement artifacts
+bench/*.txt
