@@ -10,13 +10,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Self
 
 from baton.worker.probe import Backend, BenchResult, Capabilities, MemoryBudget
 
 if TYPE_CHECKING:  # transport lane (PRD 8); imported for types only
     from baton.common.messages import Frame
-
     from baton.worker.engine import ForwardEngine
 
 #: Heartbeat period, `health` every 2 s (PRD 6.1 step 6).
@@ -71,7 +70,7 @@ class SleepInhibitor:
     platform is not an error: the worker warns once and runs on.
     """
 
-    def __enter__(self) -> SleepInhibitor:
+    def __enter__(self) -> Self:
         raise NotImplementedError
 
     def __exit__(self, *exc: object) -> None:
