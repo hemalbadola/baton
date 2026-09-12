@@ -341,6 +341,11 @@ class DecoderStack(nn.Module):
         self.lm_head = (
             nn.Linear(spec.hidden, spec.vocab, bias=False, **factory) if head else None
         )
+        # Llama 3.2 1B and 3B ship no `lm_head.weight`; the embedding is reused
+        # (PRD 5.1). On a single-device run one stack holds both, so share the
+        # tensor instead of keeping a second copy.
+        if self.lm_head is not None and self.embed_tokens is not None and spec.tie_embeddings:
+            self.lm_head.weight = self.embed_tokens.weight
 
         # fp32 tables regardless of compute dtype; `apply_rope` casts the slice.
         cos, sin = build_rope_tables(spec, self.max_ctx, device=torch.device(device or "cpu"))
