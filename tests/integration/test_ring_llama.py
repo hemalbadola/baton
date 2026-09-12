@@ -104,15 +104,16 @@ def test_wire_bf16_agreement(llama, baseline):
         for prompt, base in zip(prompts, baseline, strict=True):
             ids = torch.tensor([*prompt, *base.tokens])
             h = first(first.embed(ids).float())
-            want = second(h).argmax(-1)
+            want_logits = second(h)
             got_logits = second(h.to(torch.bfloat16).to(torch.float32))
-            got = got_logits.argmax(-1)
             # Position 0 of the generation is the last prompt row.
             p0 = len(prompt) - 1
             window = slice(p0, p0 + M0_TOKENS)
-            agree += int((want[window] == got[window]).sum())
+            want = want_logits[window].argmax(-1)
+            got = got_logits[window].argmax(-1)
+            agree += int((want == got).sum())
             total += M0_TOKENS
-            gap = (second(h)[p0] - got_logits[p0]).abs().max().item()
+            gap = (want_logits[p0] - got_logits[p0]).abs().max().item()
             worst_gap = max(worst_gap, gap)
 
     print(f"\nwire bf16 teacher-forced agreement {agree}/{total} = {agree / total:.4f}")
