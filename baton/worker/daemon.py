@@ -8,7 +8,6 @@ split is what keeps the 2 s heartbeat alive while a prefill chunk runs.
 
 from __future__ import annotations
 
-import enum
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -40,26 +39,6 @@ DATA_CONNECT_S = 30.0
 
 #: mDNS service type the head advertises.
 SERVICE_TYPE = "_baton._tcp.local."
-
-
-class WorkerState(enum.Enum):
-    """Where the daemon is in its own lifecycle.
-
-    This is the worker's private view. The head keeps its own registry state
-    (PRD 7), and the two are not required to agree during a reconnect.
-    """
-
-    STARTING = "starting"
-    DISCOVERING = "discovering"
-    CONNECTED = "connected"
-    """Control connection open, `hello` sent, waiting for `load`."""
-
-    LOADING = "loading"
-    LOADED = "loaded"
-    RECONNECTING = "reconnecting"
-    """Control connection dropped. Shard still resident, clock running."""
-
-    STOPPING = "stopping"
 
 
 @dataclass(slots=True)
@@ -121,14 +100,20 @@ class WorkerDaemon:
 
     def __init__(self, config: WorkerConfig) -> None:
         self.config = config
-        self.state = WorkerState.STARTING
         self.backend: Backend | None = None
         self.caps: Capabilities | None = None
         self.budget: MemoryBudget | None = None
         self.engine: ForwardEngine | None = None
         self.loaded_rev: int | None = None
         """Plan revision of the resident shard, echoed in `hello` and `health`
-        so a returning worker can skip reloading (PRD 6.1, 11.3)."""
+        so a returning worker can skip reloading (PRD 6.1, 11.3). None means
+        nothing is resident, which is also how `handle_load` knows to skip the
+        free step."""
+
+        self.reconnect_deadline: float | None = None
+        """`perf_counter()` at which the 30 s shard hold expires. None while the
+        control connection is up. These two fields are the whole worker state:
+        every branch in PRD 6.1 and 11.3 turns on one of them."""
 
     async def run(self) -> None:
         """Run the startup sequence, then serve until stopped.

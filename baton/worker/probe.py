@@ -30,7 +30,6 @@ class MemoryBudget:
 
     mem_total_bytes: int
     mem_free_bytes: int
-    os_reserve_bytes: int
     usable_bytes: int
 
 
@@ -73,11 +72,6 @@ def pick_device(requested: str = "auto") -> Backend:
     raise NotImplementedError
 
 
-def compute_dtype_for(backend: Backend) -> str:
-    """Return the compute dtype for this backend by the PRD 5.5 rule."""
-    raise NotImplementedError
-
-
 def memory_total_free(backend: Backend) -> tuple[int, int]:
     """Return `(mem_total_bytes, mem_free_bytes)` for this backend.
 
@@ -85,11 +79,6 @@ def memory_total_free(backend: Backend) -> tuple[int, int]:
     maximum rather than a true free figure, so the free value is clamped by the
     host free memory from `psutil`: unified memory is shared with the OS.
     """
-    raise NotImplementedError
-
-
-def disk_free(cache_dir: Path) -> int:
-    """Free bytes on the filesystem that holds the shard cache."""
     raise NotImplementedError
 
 
@@ -120,6 +109,9 @@ def probe_capabilities(
 ) -> Capabilities:
     """Gather the full `caps` block.
 
+    `compute_dtype` comes from the PRD 5.5 rule, which the model lane owns, and
+    `disk_free_bytes` is `shutil.disk_usage(cache_dir).free`.
+
     Cost target: under 200 ms, because this runs on startup and again whenever
     the head asks for a refresh. `bench` is carried through unchanged: the
     benchmark is run separately, on demand, and is not part of the probe.
@@ -130,7 +122,7 @@ def probe_capabilities(
 def memory_budget(backend: Backend, max_mem_bytes: int | None = None) -> MemoryBudget:
     """Compute the memory budget (PRD 6.3).
 
-    `usable_bytes = min(mem_free_bytes, max_mem_bytes) - os_reserve_bytes`,
+    `usable_bytes = min(mem_free_bytes, max_mem_bytes) - OS_RESERVE_BYTES[backend]`,
     floored at zero. `--max-mem` lets a 64 GB machine simulate a 4 GB one and
     lets a user keep memory for other work.
     """
