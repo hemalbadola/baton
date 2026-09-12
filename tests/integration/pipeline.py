@@ -11,6 +11,15 @@ next node is N1, so `next` and `release` travel the same link as `act`
 goes on the node's own queue without a socket. That single-node ring is the
 baseline the multi-process rings are compared against.
 
+The `prompt` frame is forwarded around the ring ahead of the first `act`, so
+Nk learns `max_len`, `sampling` and `stop_ids` from the frame PRD 8.3 defines
+for them, and nothing rides on `act` beyond its schema (PRD 10.3 stores them
+per request on Nk).
+
+Per-frame timing never crosses the wire beyond the `trace` entries PRD 17.2
+names. Each node keeps its own `(t_recv, t_send, compute)` samples and writes
+them to `stats_path` when the head terminates it.
+
 Weights come from one of two sources. `("random", seed)` draws every tensor
 from a generator seeded by the tensor's checkpoint name, so two processes
 holding different layer ranges still hold the same numbers. `("safetensors",
@@ -20,14 +29,19 @@ path)` reads only the tensors the node owns.
 from __future__ import annotations
 
 import asyncio
+import json
 import multiprocessing as mp
+import os
+import signal
 import socket
 import sys
+import tempfile
 import time
 import traceback
 import zlib
 from dataclasses import dataclass, field
 from itertools import pairwise
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -58,9 +72,6 @@ LOAD_TIMEOUT = 300.0
 # node fails the test instead of hanging it.
 FRAME_TIMEOUT = 300.0
 
-# The first `act` of a request carries what only N1 was told (PRD 10.3).
-FIRST_KEYS = ("prompt_ids", "max_len", "sampling", "stop_ids")
-
 WeightSource = tuple[str, Any]
 
 
@@ -82,6 +93,7 @@ class NodeConfig:
     # `--quant bf16` with compute forced to fp32) is stored as bf16 and upcast
     # inside each matmul: the upcast is exact, and the shard is half the size.
     storage: str = "fp32"
+    stats_path: str = ""  # where the node dumps its timing samples on SIGTERM
 
     @property
     def embed(self) -> bool:
@@ -256,12 +268,14 @@ class Node:
         self.dtype = DTYPES[cfg.compute]
         self.kv: dict[str, list[KV]] = {}
         self.reqs: dict[str, Request] = {}
+        self.stats: list[tuple[float, float, float]] = []  # (t_recv, t_send, compute)
         self.inbox: asyncio.Queue[tuple[float, dict, bytes]] = asyncio.Queue()
         self.next_writer: asyncio.StreamWriter | None = None
         self.head_writer: asyncio.StreamWriter | None = None
 
     async def serve(self) -> None:
         cfg = self.cfg
+        asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, self._dump_and_exit)
         # Listen only once the shard is resident, so "accepting" means "ready".
         server = await asyncio.start_server(self._accept, "127.0.0.1", cfg.port)
         if cfg.next_addr:
@@ -296,16 +310,11 @@ class Node:
             elif t == "next":
                 t0 = time.perf_counter()
                 x = self._embed([meta["id"]])
-                await self._run(req, x, meta["pos"], True, meta["trace"], t_recv, {}, t0)
+                await self._run(req, x, meta["pos"], True, meta["trace"], t_recv, t0)
             elif t == "act":
-                first = {k: meta[k] for k in FIRST_KEYS if k in meta}
-                if first:
-                    self._open(req, first)
                 x = from_wire(payload, meta["n"], self.cfg.spec.hidden, meta["dtype"])
                 x = x.to(self.cfg.device, self.dtype)
-                await self._run(
-                    req, x, meta["pos"], meta["last"], meta["trace"], t_recv, first, None
-                )
+                await self._run(req, x, meta["pos"], meta["last"], meta["trace"], t_recv, None)
             elif t == "release":
                 self.kv.pop(req, None)
                 self.reqs.pop(req, None)
@@ -319,38 +328,33 @@ class Node:
     def _embed(self, ids: list[int]) -> torch.Tensor:
         return self.stack.embed(torch.tensor(ids, device=self.cfg.device)).to(self.dtype)
 
-    def _open(self, req: str, first: dict[str, Any]) -> None:
-        """First frame of a request on this node: allocate KV, and on Nk the sampler."""
+    async def _prompt(self, req: str, meta: dict[str, Any], t_recv: float) -> None:
+        """The `prompt` frame: open the request, pass the frame on, and on N1 prefill."""
         spec = self.cfg.spec
+        ids = meta["ids"]
         self.kv[req] = make_kv(
-            spec, self.stack.n_local_layers, first["max_len"], self.cfg.device, self.dtype
+            spec, self.stack.n_local_layers, meta["max_len"], self.cfg.device, self.dtype
         )
         if self.cfg.head:
-            ids = first["prompt_ids"]
             self.reqs[req] = Request(
                 prompt_ids=ids,
-                max_tokens=first["max_len"] - len(ids),
-                stop_ids=set(first["stop_ids"]),
-                sampler=Sampler(SamplingParams(**first["sampling"]), device=self.cfg.device),
+                max_tokens=meta["max_len"] - len(ids),
+                stop_ids=set(meta["stop_ids"]),
+                sampler=Sampler(SamplingParams(**meta["sampling"]), device=self.cfg.device),
             )
-
-    async def _prompt(self, req: str, meta: dict[str, Any], t_recv: float) -> None:
-        ids = meta["ids"]
-        first = {
-            "prompt_ids": ids,
-            "max_len": meta["max_len"],
-            "sampling": meta["sampling"],
-            "stop_ids": meta["stop_ids"],
-        }
-        self._open(req, first)
+        else:
+            # The link is FIFO, so the next node opens the request before the
+            # first `act` of it arrives. Nk does not forward: the ring would
+            # bring the frame back to N1.
+            await self._send_next(meta)
+        if not self.cfg.embed:
+            return
         for start in range(0, len(ids), CHUNK):
             chunk = ids[start : start + CHUNK]
             last = start + len(chunk) == len(ids)
             t0 = time.perf_counter()
             x = self._embed(chunk)
-            await self._run(
-                req, x, start, last, meta["trace"], t_recv, first if start == 0 else {}, t0
-            )
+            await self._run(req, x, start, last, meta["trace"], t_recv, t0)
 
     async def _run(
         self,
@@ -360,7 +364,6 @@ class Node:
         last: bool,
         trace: list,
         t_recv: float,
-        first: dict[str, Any],
         t0: float | None,
     ) -> None:
         """Run the local layers on `x`, then pass it on or sample from it.
@@ -386,7 +389,6 @@ class Node:
                 "dtype": self.cfg.wire,
                 "last": last,
                 "trace": [*trace, entry],
-                **first,
             }
             await self._send_next(meta, to_wire(y, self.cfg.wire))
         elif last:
@@ -402,14 +404,8 @@ class Node:
         r.gen.append(tid)
         stopped = tid in r.stop_ids
         final = stopped or len(r.gen) >= r.max_tokens
-        token: dict[str, Any] = {
-            "t": "token",
-            "req": req,
-            "id": tid,
-            "pos": pos,
-            "final": final,
-            "trace": [*trace, self._entry(t_recv, t0)],
-        }
+        self._entry(t_recv, t0)  # `token` carries no trace (PRD 8.3); keep the sample
+        token: dict[str, Any] = {"t": "token", "req": req, "id": tid, "pos": pos, "final": final}
         if final:
             token["reason"] = "stop" if stopped else "length"
         await send_frame(self.head_writer, token)
@@ -419,9 +415,15 @@ class Node:
             await self._send_next({"t": "next", "req": req, "id": tid, "pos": pos, "trace": []})
 
     def _entry(self, t_recv: float, t0: float) -> dict[str, Any]:
-        """One trace entry (PRD 17.2), plus the compute time so overhead is separable."""
+        """One trace entry (PRD 17.2). The compute time stays local, in `stats`."""
         now = time.perf_counter()
-        return {"node": self.cfg.name, "t_recv": t_recv, "t_send": now, "compute": now - t0}
+        self.stats.append((t_recv, now, now - t0))
+        return {"node": self.cfg.name, "t_recv": t_recv, "t_send": now}
+
+    def _dump_and_exit(self) -> None:
+        if self.cfg.stats_path:
+            Path(self.cfg.stats_path).write_text(json.dumps(self.stats))
+        os._exit(0)
 
     async def _send_next(self, meta: dict[str, Any], payload: bytes = b"") -> None:
         if self.next_writer is None:  # k == 1: the ring is this process (PRD 10.2)
@@ -447,7 +449,6 @@ class Generation:
     prompt: list[int]
     tokens: list[int] = field(default_factory=list)
     reason: str = ""
-    traces: list[list[dict[str, Any]]] = field(default_factory=list)
 
 
 def free_port() -> int:
@@ -461,6 +462,7 @@ def ring_configs(
     ranges: list[tuple[int, int]],
     weights: WeightSource,
     head_port: int,
+    stats_dir: str = "",
     **node_kw: Any,
 ) -> list[NodeConfig]:
     """One config per node. `ranges` must tile `[0, n_layers)` in order."""
@@ -478,6 +480,7 @@ def ring_configs(
             layer_start=start,
             layer_end=end,
             weights=weights,
+            stats_path=f"{stats_dir}/n{i + 1}.json" if stats_dir else "",
             **node_kw,
         )
         for i, (start, end) in enumerate(ranges)
@@ -494,14 +497,26 @@ def run_ring(
     stop_ids: tuple[int, ...] = (),
     sampling: dict[str, Any] | None = None,
     concurrent: bool = False,
+    stats: dict[str, list] | None = None,
     **node_kw: Any,
 ) -> list[Generation]:
-    """Start the ring, run every prompt through it, tear it down."""
+    """Start the ring, run every prompt through it, tear it down.
+
+    Pass a dict as `stats` to receive each node's `(t_recv, t_send, compute)`
+    samples, keyed by node name.
+    """
     head_port = free_port()
-    cfgs = ring_configs(spec, ranges, weights, head_port, **node_kw)
-    return asyncio.run(
-        _drive(cfgs, head_port, prompts, max_tokens, stop_ids, sampling or GREEDY, concurrent)
-    )
+    with tempfile.TemporaryDirectory() as stats_dir:
+        cfgs = ring_configs(spec, ranges, weights, head_port, stats_dir, **node_kw)
+        gens = asyncio.run(
+            _drive(cfgs, head_port, prompts, max_tokens, stop_ids, sampling or GREEDY, concurrent)
+        )
+        if stats is not None:
+            for cfg in cfgs:
+                path = Path(cfg.stats_path)
+                if path.exists():
+                    stats[cfg.name] = json.loads(path.read_text())
+    return gens
 
 
 async def _drive(cfgs, head_port, prompts, max_tokens, stop_ids, sampling, concurrent):
@@ -575,7 +590,6 @@ async def _drive(cfgs, head_port, prompts, max_tokens, stop_ids, sampling, concu
                 g = gens[meta["req"]]
                 if meta["t"] == "token":
                     g.tokens.append(meta["id"])
-                    g.traces.append(meta["trace"])
                     assert meta["pos"] == len(g.prompt) + len(g.tokens) - 1
                     if meta["final"]:
                         g.reason = meta["reason"]
@@ -640,13 +654,11 @@ def generate_in_process(
     return out
 
 
-def overhead_seconds(gens: list[Generation]) -> list[float]:
-    """Node-side per-frame overhead from the traces: wall time on the node minus compute.
+def overhead_seconds(samples: list) -> list[float]:
+    """Node-side per-frame overhead from one node's samples: wall minus compute.
 
     That is decode of the meta, bytes to tensor, tensor to bytes, encode of
     the reply, and the queue hop between the reader task and the worker task.
     The socket write itself comes after `t_send` and is not included.
     """
-    return [
-        e["t_send"] - e["t_recv"] - e["compute"] for g in gens for trace in g.traces for e in trace
-    ]
+    return [t_send - t_recv - compute for t_recv, t_send, compute in samples]
