@@ -29,6 +29,9 @@ from .conftest import M0_TOKENS
 pytestmark = pytest.mark.slow
 
 SPLIT = 8  # of 16 layers
+# The checkpoint is bf16. Keep it that way in memory and compute in fp32: the
+# upcast is exact and the machine has 8 GB (see `pipeline.UpcastLinear`).
+STORE = {"storage": "bf16"}
 BF16_AGREEMENT = 0.99  # PRD 16.2
 BF16_LOGIT_GAP = 0.05  # PRD 16.2, position 0
 
@@ -61,7 +64,7 @@ def report_overhead(label: str, gens) -> None:
 def baseline(llama):
     """One process holding every layer, through the same engine loop."""
     spec, weights, prompts = llama
-    gens = run_ring(spec, [(0, spec.n_layers)], weights, prompts, M0_TOKENS)
+    gens = run_ring(spec, [(0, spec.n_layers)], weights, prompts, M0_TOKENS, **STORE)
     report_overhead("k=1 cpu fp32", gens)
     return gens
 
@@ -69,7 +72,7 @@ def baseline(llama):
 def test_two_processes_identical_fp32(llama, baseline):
     """PRD 16.2 first run, and the PRD 19 exit condition. Identical, not close."""
     spec, weights, prompts = llama
-    two = run_ring(spec, [(0, SPLIT), (SPLIT, spec.n_layers)], weights, prompts, M0_TOKENS)
+    two = run_ring(spec, [(0, SPLIT), (SPLIT, spec.n_layers)], weights, prompts, M0_TOKENS, **STORE)
     report_overhead("k=2 cpu fp32 wire fp32", two)
 
     assert all(len(g.tokens) == M0_TOKENS for g in two)
@@ -79,7 +82,7 @@ def test_two_processes_identical_fp32(llama, baseline):
 def test_one_process_ring_matches_a_plain_loop(llama, baseline):
     """The baseline is the engine loop. A plain loop with no engine agrees too."""
     spec, weights, prompts = llama
-    plain = generate_in_process(spec, weights, prompts, M0_TOKENS)
+    plain = generate_in_process(spec, weights, prompts, M0_TOKENS, **STORE)
     assert plain == tokens(baseline)
 
 
@@ -92,15 +95,15 @@ def test_wire_bf16_agreement(llama, baseline):
     a bf16 hop pick the same token? One forward per prompt answers it exactly.
     """
     spec, weights, prompts = llama
-    first = build_stack(NodeConfig("a", 0, "", "", spec, 0, SPLIT, weights))
-    second = build_stack(NodeConfig("b", 0, "", "", spec, SPLIT, spec.n_layers, weights))
+    first = build_stack(NodeConfig("a", 0, "", "", spec, 0, SPLIT, weights, **STORE))
+    second = build_stack(NodeConfig("b", 0, "", "", spec, SPLIT, spec.n_layers, weights, **STORE))
 
     agree = total = 0
     worst_gap = 0.0
     with torch.inference_mode():
         for prompt, base in zip(prompts, baseline, strict=True):
             ids = torch.tensor([*prompt, *base.tokens])
-            h = first(first.embed(ids))
+            h = first(first.embed(ids).float())
             want = second(h).argmax(-1)
             got_logits = second(h.to(torch.bfloat16).to(torch.float32))
             got = got_logits.argmax(-1)
@@ -123,7 +126,13 @@ def test_wire_bf16_ring_runs(llama, baseline):
     token is expected and is not a failure (PRD 16.2)."""
     spec, weights, prompts = llama
     two = run_ring(
-        spec, [(0, SPLIT), (SPLIT, spec.n_layers)], weights, prompts, M0_TOKENS, wire="bf16"
+        spec,
+        [(0, SPLIT), (SPLIT, spec.n_layers)],
+        weights,
+        prompts,
+        M0_TOKENS,
+        wire="bf16",
+        **STORE,
     )
     report_overhead("k=2 cpu fp32 wire bf16", two)
     matched = 0
@@ -144,9 +153,15 @@ def test_two_processes_identical_mps(llama, baseline):
     figure of PRD 16.3, not a gate here.
     """
     spec, weights, prompts = llama
-    one = run_ring(spec, [(0, spec.n_layers)], weights, prompts, M0_TOKENS, device="mps")
+    one = run_ring(spec, [(0, spec.n_layers)], weights, prompts, M0_TOKENS, device="mps", **STORE)
     two = run_ring(
-        spec, [(0, SPLIT), (SPLIT, spec.n_layers)], weights, prompts, M0_TOKENS, device="mps"
+        spec,
+        [(0, SPLIT), (SPLIT, spec.n_layers)],
+        weights,
+        prompts,
+        M0_TOKENS,
+        device="mps",
+        **STORE,
     )
     report_overhead("k=2 mps fp32 wire fp32", two)
     assert tokens(two) == tokens(one)

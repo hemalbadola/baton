@@ -31,6 +31,8 @@ from itertools import pairwise
 from typing import Any
 
 import torch
+import torch.nn.functional as F
+from torch import nn
 
 from baton.common.net import (
     LinkClosed,
@@ -76,6 +78,10 @@ class NodeConfig:
     compute: str = "fp32"
     wire: str = "fp32"
     max_ctx: int = 512
+    # Dtype the weights sit in. A bf16 checkpoint computed in fp32 (PRD 16.2,
+    # `--quant bf16` with compute forced to fp32) is stored as bf16 and upcast
+    # inside each matmul: the upcast is exact, and the shard is half the size.
+    storage: str = "fp32"
 
     @property
     def embed(self) -> bool:
@@ -157,6 +163,20 @@ def load_weights(
     raise ValueError(f"unknown weight source {kind!r}")
 
 
+class UpcastLinear(nn.Linear):
+    """`nn.Linear` whose weight is cast to the input's dtype on every call.
+
+    This is the quant-tier versus compute-dtype split of PRD 5.5 in its
+    simplest form: bf16 storage, fp32 maths. A bf16 value converts to fp32
+    without rounding, so a stack built this way computes the same bits as one
+    holding fp32 copies of the same weights, in a third of the memory.
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        bias = None if self.bias is None else self.bias.to(x.dtype)
+        return F.linear(x, self.weight.to(x.dtype), bias)
+
+
 def build_stack(cfg: NodeConfig) -> DecoderStack:
     stack = DecoderStack(
         cfg.spec,
@@ -166,12 +186,16 @@ def build_stack(cfg: NodeConfig) -> DecoderStack:
         head=cfg.head,
         max_ctx=cfg.max_ctx,
         device=cfg.device,
-        dtype=DTYPES[cfg.compute],
+        dtype=DTYPES[cfg.storage],
     )
     weights = load_weights(
         cfg.spec, cfg.weights, cfg.layer_start, cfg.layer_end, embed=cfg.embed, head=cfg.head
     )
     stack.load_hf_weights(weights)
+    if cfg.storage != cfg.compute:
+        for m in stack.modules():
+            if type(m) is nn.Linear:
+                m.__class__ = UpcastLinear
     return stack.eval()
 
 
@@ -270,7 +294,7 @@ class Node:
             if t == "prompt":
                 await self._prompt(req, meta, t_recv)
             elif t == "next":
-                x = self.stack.embed(torch.tensor([meta["id"]], device=self.cfg.device))
+                x = self._embed([meta["id"]])
                 await self._run(req, x, meta["pos"], True, meta["trace"], t_recv, {})
             elif t == "act":
                 first = {k: meta[k] for k in FIRST_KEYS if k in meta}
@@ -288,6 +312,9 @@ class Node:
                     await self._send_next(meta)
             else:
                 raise ValueError(f"{self.cfg.name}: unexpected frame {t!r}")
+
+    def _embed(self, ids: list[int]) -> torch.Tensor:
+        return self.stack.embed(torch.tensor(ids, device=self.cfg.device)).to(self.dtype)
 
     def _open(self, req: str, first: dict[str, Any]) -> None:
         """First frame of a request on this node: allocate KV, and on Nk the sampler."""
@@ -316,7 +343,7 @@ class Node:
         for start in range(0, len(ids), CHUNK):
             chunk = ids[start : start + CHUNK]
             last = start + len(chunk) == len(ids)
-            x = self.stack.embed(torch.tensor(chunk, device=self.cfg.device))
+            x = self._embed(chunk)
             await self._run(req, x, start, last, meta["trace"], t_recv, first if start == 0 else {})
 
     async def _run(
@@ -568,6 +595,7 @@ def generate_in_process(
     *,
     device: str = "cpu",
     compute: str = "fp32",
+    storage: str = "fp32",
     max_ctx: int = 512,
 ) -> list[list[int]]:
     """Plain greedy loop over one full stack. No sockets, no queue, no chunking.
@@ -577,7 +605,7 @@ def generate_in_process(
     point at the loop, not the maths.
     """
     cfg = NodeConfig(
-        "ref", 0, "", "", spec, 0, spec.n_layers, weights, device, compute, "fp32", max_ctx
+        "ref", 0, "", "", spec, 0, spec.n_layers, weights, device, compute, "fp32", max_ctx, storage
     )
     stack = build_stack(cfg)
     dtype = DTYPES[compute]
@@ -585,7 +613,7 @@ def generate_in_process(
     with torch.inference_mode():
         for ids in prompts:
             kv = make_kv(spec, spec.n_layers, len(ids) + max_tokens, device, dtype)
-            x = stack.embed(torch.tensor(ids, device=device))
+            x = stack.embed(torch.tensor(ids, device=device)).to(dtype)
             logits = stack(x, pos_start=0, cache=kv, last_only=True)
             gen: list[int] = []
             while len(gen) < max_tokens:
@@ -594,7 +622,7 @@ def generate_in_process(
                 if len(gen) == max_tokens:
                     break
                 pos = len(ids) + len(gen) - 1
-                x = stack.embed(torch.tensor([tid], device=device))
+                x = stack.embed(torch.tensor([tid], device=device)).to(dtype)
                 logits = stack(x, pos_start=pos, cache=kv, last_only=True)
             out.append(gen)
     return out
