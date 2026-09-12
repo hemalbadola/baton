@@ -8,8 +8,9 @@ These types are static only. They cost nothing at runtime, because a TypedDict
 is a plain `dict`. For runtime work use `message_type()` and `MESSAGE_TYPES`.
 """
 
-from __future__ import annotations
-
+# No `from __future__ import annotations` here, on purpose. PEP 563 turns every
+# annotation into a string, and a TypedDict then cannot see `NotRequired`, so
+# `__required_keys__` comes out wrong. Runtime code reads those sets.
 from typing import Any, Literal, NotRequired, TypedDict
 
 __all__ = [
