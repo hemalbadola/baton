@@ -19,7 +19,7 @@ try:  # pragma: no cover - import side effect
 except ModuleNotFoundError:  # pragma: no cover
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from baton.model.spec import ModelSpec  # noqa: E402
+from baton.model.spec import ModelSpec
 
 transformers = pytest.importorskip("transformers", reason="the reference implementation")
 
@@ -181,7 +181,7 @@ def randomize(module: torch.nn.Module, seed: int = SEED) -> torch.nn.Module:
     generator = torch.Generator().manual_seed(seed)
     with torch.no_grad():
         for name, param in module.named_parameters():
-            if name.endswith("layernorm.weight") or name.endswith("norm.weight"):
+            if name.endswith(("layernorm.weight", "norm.weight")):
                 param.copy_(1 + 0.02 * torch.randn(param.shape, generator=generator))
             else:
                 param.copy_(0.02 * torch.randn(param.shape, generator=generator))
