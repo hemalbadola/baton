@@ -1,0 +1,31 @@
+[project]
+name = "baton"
+version = "0.0.0"
+description = "LAN-distributed LLM inference. One model, many laptops, one relay."
+requires-python = ">=3.11"
+dependencies = [
+    "torch",
+    "numpy",
+    "safetensors",
+    "zeroconf",
+    "httpx",
+    "psutil",
+    "typer",
+]
+
+[project.optional-dependencies]
+head = ["fastapi", "uvicorn", "transformers", "jinja2"]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+baton = "baton.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
