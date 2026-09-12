@@ -29,17 +29,17 @@ from torch import Tensor, nn
 from baton.model.spec import ModelSpec
 
 __all__ = [
-    "LayerKVCache",
-    "rms_norm",
-    "RMSNorm",
-    "build_rope_tables",
-    "rotate_half",
-    "apply_rope",
-    "causal_mask",
-    "Attention",
     "MLP",
+    "Attention",
     "DecoderLayer",
     "DecoderStack",
+    "LayerKVCache",
+    "RMSNorm",
+    "apply_rope",
+    "build_rope_tables",
+    "causal_mask",
+    "rms_norm",
+    "rotate_half",
 ]
 
 
@@ -338,9 +338,7 @@ class DecoderStack(nn.Module):
             DecoderLayer(spec, **factory) for _ in range(layer_start, layer_end)
         )
         self.norm = RMSNorm(spec.hidden, spec.rms_eps, **factory) if head else None
-        self.lm_head = (
-            nn.Linear(spec.hidden, spec.vocab, bias=False, **factory) if head else None
-        )
+        self.lm_head = nn.Linear(spec.hidden, spec.vocab, bias=False, **factory) if head else None
         # Llama 3.2 1B and 3B ship no `lm_head.weight`; the embedding is reused
         # (PRD 5.1). On a single-device run one stack holds both, so share the
         # tensor instead of keeping a second copy.
