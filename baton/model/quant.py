@@ -22,7 +22,7 @@ guards against.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 import torch
@@ -101,6 +101,8 @@ class QuantWeight:
     scale: torch.Tensor | None = None
     zero: torch.Tensor | None = None
     group: int = GROUP
+    _packed: dict = field(default_factory=dict, repr=False, compare=False)
+    """Kernel-ready int4 weights, built once per (device, dtype). Never persisted."""
 
     @property
     def nbytes(self) -> int:
@@ -142,7 +144,7 @@ class QuantWeight:
             move(self.scale),
             move(self.zero),
             self.group,
-        )
+        )  # the packed cache is rebuilt on the new device, not copied
 
     def to_tensors(self) -> dict[str, torch.Tensor]:
         """Flatten to named tensors, ready for :func:`safetensors_io.save_safetensors`."""
@@ -333,16 +335,23 @@ def _int4_mm_fast(x: torch.Tensor, qw: QuantWeight) -> torch.Tensor | None:
     if ops is None:
         return None
     convert, mm = ops
-    scale = _require(qw.scale, "scale").float()
-    zero = _require(qw.zero, "zero").float()
 
-    # The kernel reconstructs w = (q - 8) * s + z. Ours is w = (q - zero) * s.
-    # Matching the two gives z = s * (8 - zero).
-    sz = torch.stack([scale, scale * (8 - zero)], dim=-1).to(x.dtype)
-    sz = sz.transpose(0, 1).contiguous()
+    # Packing walks the whole weight, so it must happen once per weight, not once
+    # per token. Decode calls this with a single row; rebuilding here costs 10x.
+    key = (x.device.type, x.dtype)
+    cached = qw._packed.get(key)
+    if cached is None:
+        scale = _require(qw.scale, "scale").float()
+        zero = _require(qw.zero, "zero").float()
+        # The kernel reconstructs w = (q - 8) * s + z. Ours is w = (q - zero) * s.
+        # Matching the two gives z = s * (8 - zero).
+        sz = torch.stack([scale, scale * (8 - zero)], dim=-1).to(x.dtype)
+        sz = sz.transpose(0, 1).contiguous()
+        q = unpack_nibbles(qw.qweight)[:, : qw.shape[1]].to(torch.int32).contiguous()
+        cached = (convert(q, 1), sz)
+        qw._packed[key] = cached
 
-    q = unpack_nibbles(qw.qweight)[:, : qw.shape[1]].to(torch.int32).contiguous()
-    packed = convert(q, 1)
+    packed, sz = cached
     return mm(x.contiguous(), packed, qw.group, sz)
 
 

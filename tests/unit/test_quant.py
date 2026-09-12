@@ -243,3 +243,34 @@ def test_compute_dtype_is_one_of_the_three_allowed(weight):
 
 def test_compute_dtype_rejects_nothing_and_defaults_to_cpu():
     assert Q.compute_dtype() == Q.compute_dtype("cpu")
+
+
+def test_the_int4_kernel_packs_the_weight_once(weight):
+    """Packing walks the whole matrix. Doing it per decode token costs 10x."""
+    if not Q.int4_fast_ok("cpu", torch.bfloat16):
+        pytest.skip("no verified int4 kernel on this backend")
+    qw = Q.quantize(weight, "int4")
+    assert qw._packed == {}
+
+    x = torch.randn(1, IN, dtype=torch.bfloat16)
+    first = Q.linear(x, qw, fast=True)
+    assert len(qw._packed) == 1
+    packed_id = id(qw._packed[("cpu", torch.bfloat16)][0])
+
+    second = Q.linear(torch.randn(1, IN, dtype=torch.bfloat16), qw, fast=True)
+    assert id(qw._packed[("cpu", torch.bfloat16)][0]) == packed_id
+    assert first.shape == second.shape
+
+
+def test_the_packed_cache_is_not_persisted(weight):
+    qw = Q.quantize(weight, "int4")
+    if Q.int4_fast_ok("cpu", torch.bfloat16):
+        Q.linear(torch.randn(1, IN, dtype=torch.bfloat16), qw, fast=True)
+    assert set(qw.to_tensors()) == {"qweight", "scale", "zero"}
+
+
+def test_moving_to_a_device_drops_the_packed_cache(weight):
+    qw = Q.quantize(weight, "int4")
+    if Q.int4_fast_ok("cpu", torch.bfloat16):
+        Q.linear(torch.randn(1, IN, dtype=torch.bfloat16), qw, fast=True)
+    assert qw.to("cpu")._packed == {}
