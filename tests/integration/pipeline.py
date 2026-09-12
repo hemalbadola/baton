@@ -294,15 +294,18 @@ class Node:
             if t == "prompt":
                 await self._prompt(req, meta, t_recv)
             elif t == "next":
+                t0 = time.perf_counter()
                 x = self._embed([meta["id"]])
-                await self._run(req, x, meta["pos"], True, meta["trace"], t_recv, {})
+                await self._run(req, x, meta["pos"], True, meta["trace"], t_recv, {}, t0)
             elif t == "act":
                 first = {k: meta[k] for k in FIRST_KEYS if k in meta}
                 if first:
                     self._open(req, first)
                 x = from_wire(payload, meta["n"], self.cfg.spec.hidden, meta["dtype"])
                 x = x.to(self.cfg.device, self.dtype)
-                await self._run(req, x, meta["pos"], meta["last"], meta["trace"], t_recv, first)
+                await self._run(
+                    req, x, meta["pos"], meta["last"], meta["trace"], t_recv, first, None
+                )
             elif t == "release":
                 self.kv.pop(req, None)
                 self.reqs.pop(req, None)
@@ -343,8 +346,11 @@ class Node:
         for start in range(0, len(ids), CHUNK):
             chunk = ids[start : start + CHUNK]
             last = start + len(chunk) == len(ids)
+            t0 = time.perf_counter()
             x = self._embed(chunk)
-            await self._run(req, x, start, last, meta["trace"], t_recv, first if start == 0 else {})
+            await self._run(
+                req, x, start, last, meta["trace"], t_recv, first if start == 0 else {}, t0
+            )
 
     async def _run(
         self,
@@ -355,9 +361,15 @@ class Node:
         trace: list,
         t_recv: float,
         first: dict[str, Any],
+        t0: float | None,
     ) -> None:
-        """Run the local layers on `x`, then pass it on or sample from it."""
-        t0 = time.perf_counter()
+        """Run the local layers on `x`, then pass it on or sample from it.
+
+        `t0` is when compute began. N1 passes the moment before its embedding
+        lookup, which PRD 10.2 counts as N1's compute. Other nodes pass None:
+        their compute starts here, after the payload became a tensor.
+        """
+        t0 = time.perf_counter() if t0 is None else t0
         with torch.inference_mode():
             # ponytail: on Nk a non-final prefill chunk only needs its KV rows,
             # but `DecoderStack.forward` always applies `lm_head`. The extra

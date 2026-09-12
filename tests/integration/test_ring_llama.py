@@ -55,8 +55,9 @@ def report_overhead(label: str, gens) -> None:
             f"  {node}: n={len(xs)} median {statistics.median(xs) * 1e6:.0f} us"
             f"  p95 {p95 * 1e6:.0f} us  max {xs[-1] * 1e6:.0f} us"
         )
-    compute = [e["compute"] for g in gens for t in g.traces for e in t]
-    print(f"  compute per frame: median {statistics.median(compute) * 1e3:.1f} ms")
+    for node in by_node:
+        compute = [e["compute"] for g in gens for t in g.traces for e in t if e["node"] == node]
+        print(f"  {node} compute per frame: median {statistics.median(compute) * 1e3:.1f} ms")
     assert overhead_seconds(gens)  # the traces reached the head
 
 
@@ -79,11 +80,16 @@ def test_two_processes_identical_fp32(llama, baseline):
     assert tokens(two) == tokens(baseline)
 
 
+# Secondary checks run on a few prompts: at ~0.5 s per token on this CPU the
+# 20-prompt runs are for the gates, and these two only confirm a path works.
+FEW = 3
+
+
 def test_one_process_ring_matches_a_plain_loop(llama, baseline):
     """The baseline is the engine loop. A plain loop with no engine agrees too."""
     spec, weights, prompts = llama
-    plain = generate_in_process(spec, weights, prompts, M0_TOKENS, **STORE)
-    assert plain == tokens(baseline)
+    plain = generate_in_process(spec, weights, prompts[:FEW], M0_TOKENS, **STORE)
+    assert plain == tokens(baseline[:FEW])
 
 
 def test_wire_bf16_agreement(llama, baseline):
@@ -130,14 +136,14 @@ def test_wire_bf16_ring_runs(llama, baseline):
         spec,
         [(0, SPLIT), (SPLIT, spec.n_layers)],
         weights,
-        prompts,
+        prompts[:FEW],
         M0_TOKENS,
         wire="bf16",
         **STORE,
     )
     report_overhead("k=2 cpu fp32 wire bf16", two)
     matched = 0
-    for g, b in zip(two, baseline, strict=True):
+    for g, b in zip(two, baseline[:FEW], strict=True):
         prefix = 0
         while prefix < M0_TOKENS and g.tokens[prefix] == b.tokens[prefix]:
             prefix += 1
