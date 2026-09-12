@@ -157,3 +157,38 @@ def test_decoder_keeps_a_partial_second_frame():
     assert dec.pending() == 5
     dec.feed(second[5:])
     assert dec.next_frame() == ({"t": "bench", "quant": "int4"}, b"")
+
+
+def test_codec_overhead_is_under_the_m0_gate():
+    """M0 exit gate: encode plus decode of one frame under 0.1 ms.
+
+    The bound is ten times the measured cost on an M-series laptop, so this
+    catches a real regression (a copy added to the hot path) and not jitter.
+    Run `python bench/frame_bench.py` for the full table.
+    """
+    import time
+
+    meta = {
+        "t": "act",
+        "req": "8f14e45fea",
+        "pos": 412,
+        "n": 1,
+        "dtype": "bf16",
+        "trace": [["n1", 1234567.8], ["n2", 1234568.1]],
+    }
+    payload = b"\xab" * (8192 * 2)  # 16 KiB, one decode hop
+    frame = encode_bytes(meta, payload)
+    meta_len = len(frame) - HEADER_SIZE - len(payload)
+    header = memoryview(frame)[:HEADER_SIZE]
+    meta_view = memoryview(frame)[HEADER_SIZE : HEADER_SIZE + meta_len]
+
+    iters = 5000
+    best = float("inf")
+    for _ in range(3):
+        start = time.perf_counter_ns()
+        for _ in range(iters):
+            encode(meta, payload)
+            decode_header(header)
+            decode_meta(meta_view)
+        best = min(best, (time.perf_counter_ns() - start) / iters / 1e6)
+    assert best < 0.1, f"{best:.4f} ms per frame exceeds the 0.1 ms M0 gate"
