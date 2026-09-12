@@ -3,7 +3,7 @@
 Interfaces only. The request and response models are real, because they are the
 contract that the CLI, the dashboard and every OpenAI client build against. The
 route bodies raise NotImplementedError until the driver (7.3) lands; each route
-delegates to a `Driver` that `baton.head.serve` attaches to `app.state.driver`.
+delegates to a `HeadSeam` that `baton.head.serve` attaches to `app.state.driver`.
 """
 
 from __future__ import annotations
@@ -19,8 +19,8 @@ __all__ = [
     "ChatCompletionRequest",
     "ClusterSnapshot",
     "CompletionRequest",
-    "Driver",
     "ErrorCode",
+    "HeadSeam",
     "create_app",
     "router",
 ]
@@ -186,8 +186,18 @@ class ModelList(BaseModel):
 # --------------------------------------------------------------------------- #
 
 
-class Driver(Protocol):
-    """What `baton.head.driver` must provide. Attached as `app.state.driver`."""
+class HeadSeam(Protocol):
+    """What the HTTP layer needs from the head. Attached as `app.state.driver`.
+
+    This is a seam, not a duplicate of `baton.head.driver.Driver`. It exists so the
+    surface lane (M3) can be built and tested before the head lane (M2) is finished.
+    The concrete backing for each method, which M2 must supply:
+
+    - `generate` and `stream`  -> `driver.Driver.submit` plus `driver.Driver.stream`
+    - `snapshot` and `subscribe` -> `registry.Registry.roster` plus `.ring`
+
+    Those concrete methods do NOT exist yet. Wiring them is the first task of M3.
+    """
 
     def snapshot(self) -> ClusterSnapshot:
         """Current cluster state (14.3)."""
@@ -256,7 +266,7 @@ def error_response(message: str, code: ErrorCode) -> dict:
     return {"error": {"message": message, "type": "server_error", "code": code}}
 
 
-def create_app(driver: Driver | None = None, dashboard_dist: str | None = None) -> FastAPI:
+def create_app(driver: HeadSeam | None = None, dashboard_dist: str | None = None) -> FastAPI:
     """Build the head's ASGI app.
 
     `dashboard_dist` mounts the Vite build at `/` (13.1). `baton.head.serve`

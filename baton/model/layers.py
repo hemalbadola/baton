@@ -29,17 +29,17 @@ from torch import Tensor, nn
 from baton.model.spec import ModelSpec
 
 __all__ = [
-    "LayerKVCache",
-    "rms_norm",
-    "RMSNorm",
-    "build_rope_tables",
-    "rotate_half",
-    "apply_rope",
-    "causal_mask",
-    "Attention",
     "MLP",
+    "Attention",
     "DecoderLayer",
     "DecoderStack",
+    "LayerKVCache",
+    "RMSNorm",
+    "apply_rope",
+    "build_rope_tables",
+    "causal_mask",
+    "rms_norm",
+    "rotate_half",
 ]
 
 
@@ -174,13 +174,19 @@ def causal_mask(
     """Boolean `[1, 1, n, kv_len]` mask, True where the query may attend.
 
     Query `i` sits at absolute position `pos_start + i` and sees every key up to
-    that position. Returns None for a single-token decode step, where every key
-    in the cache is visible and a mask would only cost memory.
+    that position. The keys end at that same position, so the first one sits at
+    `pos_start + n - kv_len`. With a cache that is 0, because the cache holds
+    every position from the start. Without one it is `pos_start`, because the
+    only keys present are the chunk's own.
+
+    Returns None for a single-token decode step, where every key is visible and
+    a mask would only cost memory.
     """
     if n == 1:
         return None
+    kv_first = pos_start + n - kv_len
     q_pos = torch.arange(pos_start, pos_start + n, device=device)
-    k_pos = torch.arange(kv_len, device=device)
+    k_pos = torch.arange(kv_first, kv_first + kv_len, device=device)
     return (k_pos.unsqueeze(0) <= q_pos.unsqueeze(1))[None, None]
 
 
@@ -338,9 +344,7 @@ class DecoderStack(nn.Module):
             DecoderLayer(spec, **factory) for _ in range(layer_start, layer_end)
         )
         self.norm = RMSNorm(spec.hidden, spec.rms_eps, **factory) if head else None
-        self.lm_head = (
-            nn.Linear(spec.hidden, spec.vocab, bias=False, **factory) if head else None
-        )
+        self.lm_head = nn.Linear(spec.hidden, spec.vocab, bias=False, **factory) if head else None
         # Llama 3.2 1B and 3B ship no `lm_head.weight`; the embedding is reused
         # (PRD 5.1). On a single-device run one stack holds both, so share the
         # tensor instead of keeping a second copy.

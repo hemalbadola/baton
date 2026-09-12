@@ -185,3 +185,23 @@ def test_our_state_dict_keys_match_the_reference():
     ours = set(DecoderLayer(make_spec("tiny")).state_dict())
     theirs = set(hf_class("tiny", "DecoderLayer")(make_hf_config("tiny"), 0).state_dict())
     assert ours == theirs
+
+
+@pytest.mark.parametrize("pos_start", [0, 5, 100])
+def test_attention_is_causal_without_a_cache(pos_start):
+    """A chunk run with no cache is still causal inside itself.
+
+    The keys then start at `pos_start`, not at 0. Reading their positions as 0
+    makes every key look older than every query and masks nothing.
+    """
+    spec = make_spec("tiny")
+    attn = randomize(Attention(spec))
+    cos, sin = build_rope_tables(spec, 256)
+    window = slice(pos_start, pos_start + N_TOKENS)
+    x = torch.randn(N_TOKENS, spec.hidden)
+
+    base = attn(x, cos[window], sin[window], pos_start=pos_start)
+    changed = x.clone()
+    changed[-1] += 5.0
+    after = attn(changed, cos[window], sin[window], pos_start=pos_start)
+    assert max_abs_diff(base[:-1], after[:-1]) < TOL_EXACT

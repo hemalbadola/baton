@@ -10,6 +10,9 @@ build/
 node_modules/
 dashboard/dist/
 .shard-cache/
-bench/*.csv
 .DS_Store
 *.tsbuildinfo
+
+# Measurement artifacts. Result CSVs are NOT ignored: PRD 15.5 says bench/ holds
+# "scripts and result CSVs for the report", so the M4 numbers must be committed.
+bench/*.txt

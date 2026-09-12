@@ -17,7 +17,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-__all__ = ["SamplingParams", "Sampler", "apply_repetition_penalty", "top_k_filter", "top_p_filter"]
+__all__ = ["Sampler", "SamplingParams", "apply_repetition_penalty", "top_k_filter", "top_p_filter"]
 
 NEG_INF = float("-inf")
 

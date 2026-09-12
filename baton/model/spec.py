@@ -59,7 +59,9 @@ class ModelSpec:
 
     def __post_init__(self) -> None:
         if self.n_heads % self.n_kv_heads:
-            raise ValueError(f"n_heads {self.n_heads} not divisible by n_kv_heads {self.n_kv_heads}")
+            raise ValueError(
+                f"n_heads {self.n_heads} not divisible by n_kv_heads {self.n_kv_heads}"
+            )
         if self.head_dim % 2:
             raise ValueError(f"head_dim {self.head_dim} must be even for RoPE")
 
@@ -109,7 +111,9 @@ class ModelSpec:
         )
         return names
 
-    def range_names(self, start: int, end: int, *, embed: bool = False, head: bool = False) -> list[str]:
+    def range_names(
+        self, start: int, end: int, *, embed: bool = False, head: bool = False
+    ) -> list[str]:
         """Every checkpoint tensor a worker holding layers `[start, end)` must fetch."""
         names: list[str] = []
         if embed:
