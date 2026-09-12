@@ -18,7 +18,7 @@ head = ["fastapi", "uvicorn", "transformers", "jinja2"]
 dev = ["pytest", "ruff"]
 
 [project.scripts]
-baton = "baton.cli:app"
+baton = "baton.cli:main"
 
 [build-system]
 requires = ["hatchling"]
