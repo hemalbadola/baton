@@ -65,7 +65,7 @@ LLAMA_3_2_1B: dict = {
 # comparison cannot run in CI. TINY keeps every flag that changes the maths --
 # llama3 rope, grouped-query attention, the same eps and theta -- and shrinks
 # only the sizes. `head_dim` 16 still puts one frequency inside the llama3
-# smoothing band, so the branch is exercised.
+# smoothing band, so that branch is exercised.
 TINY: dict = {
     **LLAMA_3_2_1B,
     "hidden_size": 128,
@@ -86,15 +86,54 @@ QWEN_TINY: dict = {
     "tie_word_embeddings": False,
 }
 
+# Each named config, and the reference family it is compared against. Llama and
+# Qwen2 are separate module trees in `transformers`: `LlamaAttention` puts a bias
+# on `o_proj` when `attention_bias` is set, and `Qwen2Attention` does not. PRD
+# 5.1 says q, k and v only, so Qwen2 is the correct reference for our Qwen flag.
+CONFIGS: dict[str, dict] = {
+    "llama-3.2-1b": LLAMA_3_2_1B,
+    "tiny": TINY,
+    "qwen-tiny": QWEN_TINY,
+}
+FAMILY: dict[str, str] = {"llama-3.2-1b": "llama", "tiny": "llama", "qwen-tiny": "qwen2"}
 
-def make_spec(config: dict, **overrides) -> ModelSpec:
-    return ModelSpec.from_config({**config, **overrides})
+# Names small enough to build a whole model from.
+SMALL_NAMES = ["tiny", "qwen-tiny"]
+ALL_NAMES = list(CONFIGS)
 
 
-def make_hf_config(config: dict, **overrides):
-    """A `LlamaConfig` holding exactly the values `make_spec` reads."""
-    merged = {**config, **overrides}
-    return transformers.LlamaConfig(
+def _family(name: str):
+    """The reference module, class-name prefix and config class for `name`."""
+    if FAMILY[name] == "qwen2":
+        from transformers.models.qwen2 import modeling_qwen2 as mod
+
+        return mod, "Qwen2", transformers.Qwen2Config
+    from transformers.models.llama import modeling_llama as mod
+
+    return mod, "Llama", transformers.LlamaConfig
+
+
+def hf_class(name: str, kind: str):
+    """A reference class, for example `hf_class("qwen-tiny", "DecoderLayer")`."""
+    mod, prefix, _ = _family(name)
+    return getattr(mod, prefix + kind)
+
+
+def hf_function(name: str, attr: str):
+    """A module-level reference function such as `apply_rotary_pos_emb`."""
+    mod, _, _ = _family(name)
+    return getattr(mod, attr)
+
+
+def make_spec(name: str, **overrides) -> ModelSpec:
+    return ModelSpec.from_config({**CONFIGS[name], **overrides})
+
+
+def make_hf_config(name: str, **overrides):
+    """A reference config holding exactly the values `make_spec` reads."""
+    merged = {**CONFIGS[name], **overrides}
+    _, _, config_cls = _family(name)
+    return config_cls(
         hidden_size=merged["hidden_size"],
         intermediate_size=merged["intermediate_size"],
         num_hidden_layers=merged["num_hidden_layers"],
@@ -112,6 +151,23 @@ def make_hf_config(config: dict, **overrides):
     )
 
 
+def hf_position_embeddings(name: str, n: int, pos_start: int = 0):
+    """cos and sin from the reference, shaped as the reference layers want them."""
+    rotary = hf_class(name, "RotaryEmbedding")(make_hf_config(name))
+    positions = torch.arange(pos_start, pos_start + n).unsqueeze(0)
+    return rotary(torch.zeros(1, n, 1, dtype=torch.float32), positions)
+
+
+def hf_causal_mask(n: int, kv_len: int | None = None, pos_start: int = 0) -> torch.Tensor:
+    """Additive float mask `[1, 1, n, kv_len]`, the form the eager path expects."""
+    kv_len = kv_len if kv_len is not None else n
+    q_pos = torch.arange(pos_start, pos_start + n).unsqueeze(1)
+    k_pos = torch.arange(kv_len).unsqueeze(0)
+    mask = torch.zeros(1, 1, n, kv_len)
+    mask.masked_fill_((k_pos > q_pos)[None, None], float("-inf"))
+    return mask
+
+
 def max_abs_diff(a: torch.Tensor, b: torch.Tensor) -> float:
     return (a.to(torch.float32) - b.to(torch.float32)).abs().max().item()
 
@@ -127,8 +183,6 @@ def randomize(module: torch.nn.Module, seed: int = SEED) -> torch.nn.Module:
         for name, param in module.named_parameters():
             if name.endswith("layernorm.weight") or name.endswith("norm.weight"):
                 param.copy_(1 + 0.02 * torch.randn(param.shape, generator=generator))
-            elif name.endswith(".bias"):
-                param.copy_(0.02 * torch.randn(param.shape, generator=generator))
             else:
                 param.copy_(0.02 * torch.randn(param.shape, generator=generator))
     return module
@@ -155,14 +209,12 @@ class RefKVCache:
         return self.k[: self.length], self.v[: self.length]
 
 
-@pytest.fixture(scope="module")
-def tiny_spec() -> ModelSpec:
-    return make_spec(TINY)
+def make_caches(spec: ModelSpec, n_layers: int, max_ctx: int) -> list[RefKVCache]:
+    return [RefKVCache(spec, max_ctx) for _ in range(n_layers)]
 
 
-@pytest.fixture(scope="module")
-def llama_1b_spec() -> ModelSpec:
-    return make_spec(LLAMA_3_2_1B)
+def pytest_configure(config):
+    config.addinivalue_line("markers", "slow: full Llama-3.2-1B geometry, hundreds of MB")
 
 
 @pytest.fixture(autouse=True)
