@@ -28,9 +28,12 @@ def test_two_processes_match_one_process(tiny_spec, random_prompts, split):
     """The M0 exit condition on random weights, every split point."""
     n = tiny_spec.n_layers
     one = run_ring(tiny_spec, [(0, n)], RANDOM, random_prompts, TOKENS)
-    two = run_ring(tiny_spec, [(0, split), (split, n)], RANDOM, random_prompts, TOKENS)
+    stats: dict = {}
+    two = run_ring(tiny_spec, [(0, split), (split, n)], RANDOM, random_prompts, TOKENS, stats=stats)
 
     assert tokens(two) == tokens(one)
+    # Every prompt is one prefill frame plus TOKENS - 1 decode frames on each node.
+    assert {k: len(v) for k, v in stats.items()} == {"n1": 8 * TOKENS, "n2": 8 * TOKENS}
     assert all(len(g.tokens) == TOKENS and g.reason == "length" for g in two)
     # Guard on the test itself: a generation that repeats one token would pass
     # with broken layer maths. Each prompt must wander through the vocabulary.

@@ -34,55 +34,69 @@ SPLIT = 8  # of 16 layers
 STORE = {"storage": "bf16"}
 BF16_AGREEMENT = 0.99  # PRD 16.2
 BF16_LOGIT_GAP = 0.05  # PRD 16.2, position 0
+# Secondary checks run on a few prompts: at ~0.5 s per token on this CPU the
+# 20-prompt runs are for the gates, and these only confirm a path works.
+FEW = 3
 
 
 def tokens(gens):
     return [g.tokens for g in gens]
 
 
-def report_overhead(label: str, gens) -> None:
-    """Node-side per-frame overhead from the traces, printed for the report."""
-    by_node: dict[str, list[float]] = {}
-    for g in gens:
-        for trace in g.traces:
-            for e in trace:
-                by_node.setdefault(e["node"], []).append(e["t_send"] - e["t_recv"] - e["compute"])
+def report_overhead(label: str, stats: dict[str, list]) -> None:
+    """Node-side per-frame overhead and stage compute, printed for the report."""
+    assert stats, "no node wrote its stats file"
     print(f"\n[{label}] node-side per-frame overhead (wall on node minus compute):")
-    for node, xs in by_node.items():
-        xs.sort()
+    for node, samples in sorted(stats.items()):
+        xs = sorted(overhead_seconds(samples))
         p95 = xs[int(0.95 * (len(xs) - 1))]
+        compute = statistics.median(c for _, _, c in samples)
         print(
             f"  {node}: n={len(xs)} median {statistics.median(xs) * 1e6:.0f} us"
             f"  p95 {p95 * 1e6:.0f} us  max {xs[-1] * 1e6:.0f} us"
+            f"  | compute median {compute * 1e3:.1f} ms"
         )
-    for node in by_node:
-        compute = [e["compute"] for g in gens for t in g.traces for e in t if e["node"] == node]
-        print(f"  {node} compute per frame: median {statistics.median(compute) * 1e3:.1f} ms")
-    assert overhead_seconds(gens)  # the traces reached the head
+
+
+def prefix_agreement(gens, base) -> str:
+    """Matching prefix length summed over prompts. A free-running comparison:
+    one early flip changes every later token, so this is a report figure."""
+    matched = 0
+    for g, b in zip(gens, base, strict=True):
+        prefix = 0
+        while prefix < M0_TOKENS and g.tokens[prefix] == b.tokens[prefix]:
+            prefix += 1
+        matched += prefix
+    return f"{matched}/{len(gens) * M0_TOKENS}"
 
 
 @pytest.fixture(scope="module")
 def baseline(llama):
     """One process holding every layer, through the same engine loop."""
     spec, weights, prompts = llama
-    gens = run_ring(spec, [(0, spec.n_layers)], weights, prompts, M0_TOKENS, **STORE)
-    report_overhead("k=1 cpu fp32", gens)
+    stats: dict = {}
+    gens = run_ring(spec, [(0, spec.n_layers)], weights, prompts, M0_TOKENS, stats=stats, **STORE)
+    report_overhead("k=1 cpu fp32", stats)
     return gens
 
 
 def test_two_processes_identical_fp32(llama, baseline):
     """PRD 16.2 first run, and the PRD 19 exit condition. Identical, not close."""
     spec, weights, prompts = llama
-    two = run_ring(spec, [(0, SPLIT), (SPLIT, spec.n_layers)], weights, prompts, M0_TOKENS, **STORE)
-    report_overhead("k=2 cpu fp32 wire fp32", two)
+    stats: dict = {}
+    two = run_ring(
+        spec,
+        [(0, SPLIT), (SPLIT, spec.n_layers)],
+        weights,
+        prompts,
+        M0_TOKENS,
+        stats=stats,
+        **STORE,
+    )
+    report_overhead("k=2 cpu fp32 wire fp32", stats)
 
     assert all(len(g.tokens) == M0_TOKENS for g in two)
     assert tokens(two) == tokens(baseline)
-
-
-# Secondary checks run on a few prompts: at ~0.5 s per token on this CPU the
-# 20-prompt runs are for the gates, and these two only confirm a path works.
-FEW = 3
 
 
 def test_one_process_ring_matches_a_plain_loop(llama, baseline):
@@ -132,6 +146,7 @@ def test_wire_bf16_ring_runs(llama, baseline):
     """The free-running bf16 ring, reported. Divergence after a low-margin
     token is expected and is not a failure (PRD 16.2)."""
     spec, weights, prompts = llama
+    stats: dict = {}
     two = run_ring(
         spec,
         [(0, SPLIT), (SPLIT, spec.n_layers)],
@@ -139,16 +154,11 @@ def test_wire_bf16_ring_runs(llama, baseline):
         prompts[:FEW],
         M0_TOKENS,
         wire="bf16",
+        stats=stats,
         **STORE,
     )
-    report_overhead("k=2 cpu fp32 wire bf16", two)
-    matched = 0
-    for g, b in zip(two, baseline[:FEW], strict=True):
-        prefix = 0
-        while prefix < M0_TOKENS and g.tokens[prefix] == b.tokens[prefix]:
-            prefix += 1
-        matched += prefix
-    print(f"wire bf16 free-running prefix agreement {matched}/{len(two) * M0_TOKENS}")
+    report_overhead("k=2 cpu fp32 wire bf16", stats)
+    print(f"wire bf16 free-running prefix agreement {prefix_agreement(two, baseline[:FEW])}")
     assert all(len(g.tokens) == M0_TOKENS for g in two)
 
 
@@ -161,6 +171,7 @@ def test_two_processes_identical_mps(llama, baseline):
     """
     spec, weights, prompts = llama
     one = run_ring(spec, [(0, spec.n_layers)], weights, prompts, M0_TOKENS, device="mps", **STORE)
+    stats: dict = {}
     two = run_ring(
         spec,
         [(0, SPLIT), (SPLIT, spec.n_layers)],
@@ -168,15 +179,9 @@ def test_two_processes_identical_mps(llama, baseline):
         prompts,
         M0_TOKENS,
         device="mps",
+        stats=stats,
         **STORE,
     )
-    report_overhead("k=2 mps fp32 wire fp32", two)
+    report_overhead("k=2 mps fp32 wire fp32", stats)
+    print(f"\nmps vs cpu free-running prefix agreement {prefix_agreement(one, baseline)}")
     assert tokens(two) == tokens(one)
-
-    matched = 0
-    for g, b in zip(one, baseline, strict=True):
-        prefix = 0
-        while prefix < M0_TOKENS and g.tokens[prefix] == b.tokens[prefix]:
-            prefix += 1
-        matched += prefix
-    print(f"\nmps vs cpu free-running prefix agreement {matched}/{len(one) * M0_TOKENS}")
