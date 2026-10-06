@@ -46,7 +46,8 @@ This file is the ticket system for the project. Every change starts as a ticket 
 | BAT-33 | Task | Run `install.ps1` on a Windows laptop | TODO |
 | BAT-34 | Task | Head prints its address and says when it waits | DONE |
 | BAT-35 | Task | Check the model fetch against the real Hugging Face | DONE |
-| BAT-36 | Task | Publish: commit the work, push, make the repository public | TODO |
+| BAT-36 | Task | Publish: commit the work, push, make the repository public | DONE |
+| BAT-37 | Task | Host the web page | DONE |
 | BAT-10 | Story | Run int8 and int4 weights in the decoder | BACKLOG |
 | BAT-11 | Story | Use the shard cache on load, memmap the embedding table | BACKLOG |
 | BAT-12 | Story | Measure round-trip time between workers (`ping_peer`) | BACKLOG |
@@ -335,7 +336,15 @@ This file is the ticket system for the project. Every change starts as a ticket 
 - **Why:** The command on the web page reads `install.sh` and the code from GitHub. GitHub
   has the code from before this work, and the repository is private. Until this ticket is
   done, the command from the page cannot work on a different laptop.
-- **Owner:** Hemal. Commits are on hold for the split between teammates.
+- **Result:** DONE. Ten commits, grouped by area. The repository is public at
+  `https://github.com/hemalbadola/baton`. Each commit has one author, the owner. The command
+  from the live page, run against the public repository in a temporary tool directory,
+  reached READY in 24 s.
+
+### BAT-37 — Host the web page
+- **Result:** DONE. `web/` is on Vercel (project `baton`) at `https://baton-plum.vercel.app`.
+  The page and the two fonts return 200. To publish a change: `cd web && vercel deploy --prod`.
+- **Files:** `web/.gitignore`
 
 ### BAT-10 — Run int8 and int4 weights in the decoder (BACKLOG)
 - `quant.py` can quantize, but `layers.py` runs dense weights only. Until this is done,
