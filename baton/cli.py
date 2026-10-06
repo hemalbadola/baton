@@ -11,6 +11,7 @@ Configuration precedence (PRD 15.2): CLI flag > BATON_* env var >
 
 from __future__ import annotations
 
+import logging
 from enum import Enum
 from pathlib import Path
 from typing import Annotated
@@ -83,6 +84,10 @@ def root(
     quiet: Annotated[bool, typer.Option("--quiet", "-q", help="Errors only.")] = False,
 ) -> None:
     """Global options applied before any subcommand."""
+    logging.basicConfig(
+        level="DEBUG" if verbose else "ERROR" if quiet else "INFO",
+        format="%(asctime)s %(name)s: %(message)s",
+    )
 
 
 @app.command()
@@ -131,7 +136,19 @@ def worker(
     ] = False,
 ) -> None:
     """Join the cluster and serve a layer range (PRD 6.1)."""
-    raise NotImplementedError("worker: baton.worker.daemon")
+    if no_mdns and head is None:
+        raise typer.BadParameter("--no-mdns needs --head HOST[:PORT]")
+    from baton.worker.daemon import WorkerConfig, run_worker
+
+    config = WorkerConfig(
+        head=head or "auto",
+        max_mem_bytes=int(mem_budget) if mem_budget is not None else None,
+        device=backend or "auto",
+        name=name,
+        data_port=data_port,
+        cache_dir=cache_dir,
+    )
+    raise typer.Exit(run_worker(config))
 
 
 @app.command()
@@ -176,9 +193,37 @@ def serve(
     dashboard: Annotated[
         bool, typer.Option("--dashboard/--no-dashboard", help="Serve dashboard/dist at `/`.")
     ] = True,
+    local_worker: Annotated[
+        bool,
+        typer.Option("--local-worker/--no-local-worker", help="Also run a worker on this machine."),
+    ] = True,
 ) -> None:
     """Run the head, plan the cluster, load the model (PRD 7.1)."""
-    raise NotImplementedError("serve: baton.head.serve")
+    import asyncio
+
+    from baton.head import serve as head
+
+    options = head.ServeOptions(
+        model=model,
+        # The CLI names are the PRD 15 ones; the planner and the loader use the
+        # PRD 5.5 and 9 names.
+        quant={"none": "bf16"}.get(quant.value, quant.value),  # type: ignore[arg-type]
+        ctx=ctx,
+        objective={"balance": "throughput"}.get(objective.value, objective.value),
+        port=port,
+        control_port=control_port,
+        no_local_worker=not local_worker,
+        kv_fraction=0.2 if kv_fraction is None else kv_fraction,
+        min_workers=min_workers,
+        wait_s=wait,
+    )
+    try:
+        asyncio.run(head.serve(options))
+    except KeyboardInterrupt:
+        raise typer.Exit(130) from None
+    except (ValueError, FileNotFoundError) as exc:
+        typer.echo(f"baton serve: {exc}", err=True)
+        raise typer.Exit(1) from None
 
 
 @app.command()

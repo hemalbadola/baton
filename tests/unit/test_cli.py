@@ -1,5 +1,6 @@
 """The CLI surface is a contract (PRD 15.1). These tests pin the names."""
 
+import click
 import pytest
 from typer.testing import CliRunner
 
@@ -32,8 +33,6 @@ def test_cache_subcommands(sub):
 @pytest.mark.parametrize(
     "argv",
     [
-        ["worker"],
-        ["serve", "--model", "meta-llama/Llama-3.1-8B-Instruct"],
         ["status"],
         ["bench"],
         ["selftest"],
@@ -47,6 +46,19 @@ def test_body_is_not_implemented_yet(argv):
     """Every body raises NotImplementedError until its lane fills it in."""
     result = runner.invoke(app, argv)
     assert isinstance(result.exception, NotImplementedError)
+
+
+def test_serve_refuses_a_quant_tier_that_cannot_load_yet():
+    """int4 is the PRD default and is not wired into the decoder (BAT-10)."""
+    result = runner.invoke(app, ["serve", "--model", "some/model", "--no-local-worker"])
+    assert result.exit_code == 1
+    assert "--quant none" in click.unstyle(result.output)
+
+
+def test_worker_without_mdns_needs_a_head():
+    result = runner.invoke(app, ["worker", "--no-mdns"])
+    assert result.exit_code == 2
+    assert "--head" in click.unstyle(result.output)  # rich colours the usage error
 
 
 def test_required_model_flag():
