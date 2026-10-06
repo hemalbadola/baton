@@ -31,6 +31,7 @@ from baton.common.framing import HEADER_SIZE, decode_header, decode_meta, encode
 __all__ = [
     "ADMISSION_QUEUE_WAIT",
     "CONTROL_CONNECT_TIMEOUT",
+    "CONTROL_PORT",
     "DATA_CONNECT_TIMEOUT",
     "HEALTH_INTERVAL",
     "HEALTH_SILENCE_TIMEOUT",
@@ -55,6 +56,8 @@ __all__ = [
 ]
 
 log = logging.getLogger("baton.net")
+
+CONTROL_PORT = 7711  # PRD 15.3
 
 # PRD 8.6, all in seconds.
 CONTROL_CONNECT_TIMEOUT = 5.0  # per attempt; retry forever

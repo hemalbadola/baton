@@ -76,12 +76,13 @@ def test_token_reason_is_optional():
     assert Token.__optional_keys__ == frozenset({"reason"})
 
 
-def test_load_carries_the_6_4_fields_plus_index_and_headers():
+def test_load_carries_the_6_4_fields_plus_spec_index_and_headers():
     assert Load.__required_keys__ == frozenset(
         {
             "t",
             "plan_rev",
             "model",
+            "spec",
             "range",
             "quant",
             "roles",

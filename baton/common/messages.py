@@ -177,14 +177,22 @@ class Bench(TypedDict):
 class Load(TypedDict):
     """Load one shard (PRD 6.4), fetched by byte range from Hugging Face.
 
-    `index` is this node's position in the ring, zero-based: index 0 is N1.
-    `headers` are the HTTP headers for the range fetch. `hf_token` is sent apart
-    from `headers` so the head can rotate it without rebuilding the request.
+    PRD 5.3 step 1 has the worker receive the `ModelSpec`, the index JSON and
+    the shard headers from the head. PRD 8.3 lists `index` and `headers` and
+    forgets the spec, so `spec` is added here (BAT-9).
+
+    `index` maps a tensor name to the shard file that holds it, the
+    `weight_map` of `model.safetensors.index.json`. The worker reads each shard
+    header it needs through its own byte source: every header of a 70B
+    checkpoint is a few MB and does not fit the 1 MB meta limit of a frame.
+    `headers` are extra HTTP headers for the range fetch. `hf_token` is sent
+    apart from them so the head can rotate it without rebuilding the request.
     """
 
     t: Literal["load"]
     plan_rev: int
     model: str
+    spec: dict[str, Any]  # `ModelSpec.to_dict()`
     range: list[int]  # [first_layer, last_layer], inclusive
     quant: str
     roles: dict[str, bool]  # {"embed": bool, "head": bool}
@@ -192,7 +200,7 @@ class Load(TypedDict):
     kv_budget_bytes: int
     next_node: str  # "ip:port" of Ni+1, or "" for Nk
     head_data_addr: str
-    index: int
+    index: dict[str, str]
     headers: dict[str, str]
     hf_token: NotRequired[str]
 
