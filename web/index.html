@@ -1,0 +1,343 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Baton - one big model across all your laptops</title>
+<meta name="description" content="Baton splits a language model into layers and runs it across the laptops on your Wi-Fi. One command on each laptop.">
+<link rel="preload" href="fonts/Geist-Variable.woff2" as="font" type="font/woff2" crossorigin>
+<style>
+/* Geist and Geist Mono, SIL Open Font License: see fonts/OFL.txt */
+@font-face{font-family:"Geist";src:url("fonts/Geist-Variable.woff2") format("woff2");font-weight:100 900;font-display:swap}
+@font-face{font-family:"Geist Mono";src:url("fonts/GeistMono-Variable.woff2") format("woff2");font-weight:100 900;font-display:swap}
+/* ---- tokens: one neutral family (zinc), one accent, two radii ---- */
+:root{
+  --bg:#fafafa; --surface:#ffffff; --surface-2:#f4f4f5; --border:#e4e4e7; --border-strong:#d4d4d8;
+  --text:#18181b; --text-2:#52525b; --text-3:#6b6b73;
+  --accent:#c2410c; --accent-hover:#9a3412; --on-accent:#ffffff; --accent-soft:#fff1e7;
+  --ok:#166534; --warn:#92400e;
+  --r-control:8px; --r-panel:12px;
+  --sans:"Geist",ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono:"Geist Mono",ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+  --ease:cubic-bezier(.16,1,.3,1);
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#0c0c0e; --surface:#141417; --surface-2:#1b1b1f; --border:#28282e; --border-strong:#3a3a42;
+  --text:#ededef; --text-2:#a1a1aa; --text-3:#8b8b94;
+  --accent:#fb923c; --accent-hover:#fdba74; --on-accent:#1a0d04; --accent-soft:#2a1709;
+  --ok:#86efac; --warn:#fcd34d;
+}}
+:root[data-theme="dark"]{
+  --bg:#0c0c0e; --surface:#141417; --surface-2:#1b1b1f; --border:#28282e; --border-strong:#3a3a42;
+  --text:#ededef; --text-2:#a1a1aa; --text-3:#8b8b94;
+  --accent:#fb923c; --accent-hover:#fdba74; --on-accent:#1a0d04; --accent-soft:#2a1709;
+  --ok:#86efac; --warn:#fcd34d;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--text);font:400 16px/1.6 var(--sans);-webkit-font-smoothing:antialiased}
+a{color:inherit}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
+.wrap{max-width:1120px;margin-inline:auto;padding-inline:24px}
+h1,h2,h3,p{margin:0}
+h1{font:600 clamp(2.25rem,1.2rem + 3.2vw,3.25rem)/1.05 var(--sans);letter-spacing:-.035em;text-wrap:balance}
+h2{font:600 clamp(1.625rem,1.3rem + 1.2vw,1.875rem)/1.15 var(--sans);letter-spacing:-.02em;text-wrap:balance}
+h3{font:500 1.125rem/1.35 var(--sans);letter-spacing:-.01em}
+.lead{font-size:1.125rem;line-height:1.55;color:var(--text-2);max-width:34ch}
+.muted{color:var(--text-2)} .small{font-size:.875rem;line-height:1.5}
+section{padding-block:96px}
+section + section{border-top:1px solid var(--border)}
+
+/* ---- nav: one line, 64px ---- */
+.nav{height:64px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border)}
+.brand{font:600 1.125rem/1 var(--sans);letter-spacing:-.02em;text-decoration:none}
+.nav ul{display:flex;gap:28px;list-style:none;margin:0;padding:0}
+.nav a{font-size:.9375rem;color:var(--text-2);text-decoration:none}
+.nav a:hover{color:var(--text)}
+
+/* ---- buttons ---- */
+.btn{display:inline-flex;align-items:center;justify-content:center;height:44px;padding-inline:18px;border-radius:var(--r-control);
+  font:500 .9375rem/1 var(--sans);text-decoration:none;white-space:nowrap;cursor:pointer;border:1px solid transparent;
+  transition:background .16s var(--ease),transform .12s var(--ease),border-color .16s var(--ease)}
+.btn:active{transform:translateY(1px)}
+.btn-primary{background:var(--accent);color:var(--on-accent)} .btn-primary:hover{background:var(--accent-hover)}
+.btn-quiet{background:transparent;color:var(--text);border-color:var(--border-strong)} .btn-quiet:hover{background:var(--surface-2)}
+
+/* ---- hero: 5 / 7 split, collapses to one column under 900px ---- */
+.hero{padding-block:56px 80px}
+.hero-grid{display:grid;grid-template-columns:1fr 1fr;gap:48px;align-items:start}
+/* a grid child will not shrink under a long <pre> line unless told to: this is what broke phones */
+.hero-grid>*,.two>*,.panel>*,fieldset{min-width:0}
+.hero-copy{padding-top:20px;display:grid;gap:24px;justify-items:start}
+.cta{display:flex;gap:12px;flex-wrap:wrap}
+
+/* ---- configurator ---- */
+.panel{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-panel);padding:20px;display:grid;gap:18px}
+fieldset{border:0;margin:0;padding:0;min-width:0;display:grid;gap:8px}
+legend,.label{padding:0;font:500 .8125rem/1.3 var(--sans);color:var(--text-2)}
+.seg{display:grid;grid-auto-flow:column;grid-auto-columns:1fr;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--r-control);padding:3px;gap:3px}
+.seg label{position:relative;display:flex;align-items:center;justify-content:center;height:38px;border-radius:6px;font:500 .9375rem/1 var(--sans);color:var(--text-2);cursor:pointer;
+  transition:background .16s var(--ease),color .16s var(--ease)}
+.seg input{position:absolute;opacity:0;inset:0;cursor:pointer}
+.seg label:has(input:checked){background:var(--surface);color:var(--text);box-shadow:0 0 0 1px var(--border-strong)}
+.seg label:has(input:focus-visible){outline:2px solid var(--accent);outline-offset:2px}
+.hint{font-size:.8125rem;color:var(--text-3)}
+.models{display:grid;gap:6px}
+.model{display:grid;grid-template-columns:auto 1fr auto;gap:12px;align-items:center;min-height:40px;padding:6px 12px;border:1px solid var(--border);border-radius:var(--r-control);cursor:pointer}
+.model:has(input:checked){border-color:var(--text);background:var(--surface-2)}
+.model:has(input:disabled){cursor:not-allowed;color:var(--text-3)}
+.model input{accent-color:var(--accent);margin:0}
+.model b{font-weight:500}
+.fit{font:500 .8125rem/1.3 var(--mono);font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}
+.fit.ok{color:var(--ok)} .fit.no{color:var(--warn)} .fit.off{color:var(--text-3)}
+.mem{display:flex;align-items:center;gap:10px}
+.mem input{width:88px;height:38px;border:1px solid var(--border-strong);border-radius:var(--r-control);background:var(--surface);color:var(--text);padding-inline:10px;font:500 .9375rem/1 var(--mono)}
+.cmd{background:var(--surface-2);border:1px solid var(--border);border-radius:var(--r-control);overflow:hidden}
+.cmd-bar{display:flex;align-items:center;justify-content:space-between;padding:8px 8px 8px 14px;border-bottom:1px solid var(--border)}
+.cmd-bar span{font:500 .8125rem/1 var(--mono);color:var(--text-3)}
+.cmd-bar .btn{height:32px;padding-inline:12px;font-size:.8125rem}
+pre{margin:0;padding:14px;overflow-x:auto;font:400 .90625rem/1.65 var(--mono);color:var(--text);white-space:pre}
+#cmd{white-space:pre-wrap;overflow-wrap:anywhere}
+.note{font-size:.875rem;line-height:1.5;color:var(--warn);min-height:1.5em}
+[hidden]{display:none!important}
+
+/* ---- transcript: 7 / 5 split ---- */
+.two{display:grid;grid-template-columns:7fr 5fr;gap:56px;align-items:start}
+.stack{display:grid;gap:16px} .stack-lg{display:grid;gap:28px}
+.reads dt{font-weight:500} .reads dd{margin:4px 0 0;color:var(--text-2)} .reads{display:grid;gap:22px;margin:0}
+
+/* ---- ring: full width ---- */
+.ring{display:grid;grid-template-columns:1fr auto 1fr auto 1fr;gap:16px;align-items:center;margin-top:40px}
+.node{border:1px solid var(--border-strong);border-radius:var(--r-panel);padding:20px;background:var(--surface);display:grid;gap:6px}
+.node span{font:400 .8125rem/1.4 var(--mono);color:var(--text-3)}
+.hop{font:400 .8125rem/1.3 var(--mono);color:var(--text-3);text-align:center}
+.back{margin-top:16px;border:1px dashed var(--border-strong);border-radius:var(--r-control);padding:10px 14px;font:400 .8125rem/1.4 var(--mono);color:var(--text-3);text-align:center}
+.prose{max-width:62ch;display:grid;gap:14px;margin-top:40px;color:var(--text-2)}
+
+/* ---- questions: single column ---- */
+.qa{max-width:720px;margin-top:32px;border-top:1px solid var(--border)}
+details{border-bottom:1px solid var(--border)}
+summary{cursor:pointer;padding:18px 0;font-weight:500;list-style:none;display:flex;justify-content:space-between;gap:16px}
+summary::after{content:"+";font:400 1.25rem/1 var(--mono);color:var(--text-3)} details[open] summary::after{content:"-"}
+details p{padding:0 0 20px;color:var(--text-2);max-width:60ch}
+footer{border-top:1px solid var(--border);padding-block:32px;display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;font-size:.875rem;color:var(--text-3)}
+footer nav{display:flex;gap:24px}
+
+@media (max-width:900px){
+  section{padding-block:56px} .hero{padding-block:40px 56px}
+  .hero-grid,.two{grid-template-columns:1fr;gap:36px}
+  .hero-copy{padding-top:0} .lead{max-width:none}
+  .nav ul li:not(:last-child){display:none}
+  .ring{grid-template-columns:1fr} .hop{padding-block:2px}
+}
+/* ---- hero motion. Three moves, each with a job:
+   rise  = the page arrives in reading order (hierarchy)
+   relay = the baton goes laptop to laptop, which is the whole idea (story)
+   flash = the command changed because you changed a choice (feedback) ---- */
+.relay{position:relative;width:min(100%,320px);margin-top:20px;display:grid;grid-template-columns:1fr 1fr 60px;justify-items:start;
+  font:400 .75rem/1 var(--mono);color:var(--text-3)}
+.relay::before{content:"";position:absolute;left:7px;right:53px;top:7px;border-top:1px solid var(--border-strong)}
+.relay span{display:grid;justify-items:start;gap:10px;position:relative}
+.relay span::before{content:"";width:15px;height:15px;border-radius:50%;background:var(--bg);border:1px solid var(--border-strong)}
+.relay span::after{content:"";position:absolute;top:0;width:15px;height:15px;border-radius:50%;background:var(--accent);opacity:0}
+.relay .lap{position:absolute;left:7px;right:53px;top:3px;height:9px}
+.relay .lap i{display:block;width:9px;height:9px;margin-left:-4.5px;border-radius:50%;background:var(--accent)}
+.flash{animation:none}
+@media (prefers-reduced-motion:no-preference){
+  .rise{animation:rise .7s var(--ease) both;animation-delay:calc(var(--i,0)*80ms)}
+  @keyframes rise{from{opacity:0;transform:translateY(14px)}}
+  .relay .lap{animation:lap 3.6s var(--ease) infinite}
+  @keyframes lap{0%,8%{transform:translateX(0)} 36%,46%{transform:translateX(50%)} 74%,86%{transform:translateX(100%)} 100%{transform:translateX(100%)}}
+  .relay .lap i{animation:carry 3.6s linear infinite}
+  @keyframes carry{0%{opacity:0} 6%,86%{opacity:1} 94%,100%{opacity:0}}
+  .relay span::after{animation:lit 3.6s linear infinite}
+  .relay span:nth-child(1)::after{animation-delay:0s} .relay span:nth-child(2)::after{animation-delay:1.3s} .relay span:nth-child(3)::after{animation-delay:2.7s}
+  @keyframes lit{0%,2%{opacity:0} 5%,10%{opacity:.9} 22%,100%{opacity:0}}
+  .flash{animation:flash .7s var(--ease)}
+  @keyframes flash{from{background:var(--accent-soft)}}
+}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;scroll-behavior:auto!important}}
+</style>
+</head>
+<body>
+
+<header class="wrap nav">
+  <a class="brand" href="#top">baton</a>
+  <nav aria-label="Main"><ul>
+    <li><a href="#after">After you paste</a></li>
+    <li><a href="#how">How it works</a></li>
+    <li><a href="#questions">Questions</a></li>
+    <li><a href="https://github.com/hemalbadola/baton">GitHub</a></li>
+  </ul></nav>
+</header>
+
+<main id="top">
+<div class="wrap hero">
+  <div class="hero-grid">
+    <div class="hero-copy">
+      <h1 class="rise">One big model. All your laptops.</h1>
+      <p class="lead rise" style="--i:1">Baton splits a model into layers, gives each laptop a share, and passes the work between them over your Wi-Fi.</p>
+      <div class="cta rise" style="--i:2">
+        <button class="btn btn-primary" type="button" data-copy>Copy command</button>
+        <a class="btn btn-quiet" href="#how">How it works</a>
+      </div>
+      <div class="relay rise" style="--i:3" aria-hidden="true">
+        <span>laptop 1</span><span>laptop 2</span><span>laptop 3</span>
+        <div class="lap"><i></i></div>
+      </div>
+    </div>
+
+    <form class="panel rise" style="--i:2" id="config" aria-label="Build your install command" onsubmit="return false">
+      <fieldset>
+        <legend>This laptop runs (detected, change it for another laptop)</legend>
+        <div class="seg">
+          <label><input type="radio" name="os" value="mac" checked>macOS</label>
+          <label><input type="radio" name="os" value="win">Windows</label>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>This laptop will</legend>
+        <div class="seg">
+          <label><input type="radio" name="role" value="start" checked>Start the cluster</label>
+          <label><input type="radio" name="role" value="join">Join a cluster</label>
+        </div>
+        <span class="hint" id="role-hint"></span>
+      </fieldset>
+
+      <fieldset id="model-field">
+        <legend>Model</legend>
+        <div class="mem">
+          <label class="label" for="mem">Free memory across all your laptops, estimate</label>
+          <input id="mem" type="number" inputmode="numeric" min="1" max="512" value="16" aria-describedby="note"><span class="small muted">GB</span>
+        </div>
+        <div class="models" id="models"></div>
+      </fieldset>
+
+      <div class="stack">
+        <div class="cmd">
+          <div class="cmd-bar"><span id="shell">Terminal</span><button class="btn btn-quiet" type="button" data-copy>Copy command</button></div>
+          <pre id="cmd" tabindex="0" aria-label="Command to paste"></pre>
+        </div>
+        <p class="note" id="note" role="status" aria-live="polite"></p>
+      </div>
+    </form>
+  </div>
+</div>
+
+<section id="after"><div class="wrap two">
+  <div class="cmd">
+    <div class="cmd-bar"><span>Sample output of baton serve, two laptops</span></div>
+<pre>baton head f1d3bd1e: control on port 7711
+reading model metadata: unsloth/Llama-3.2-1B
+joined: macbook-air
+joined: gaming-pc
+benchmarking macbook-air, gaming-pc
+Device        Role    Layers
+macbook-air   N1      0-5
+gaming-pc     N2=Nk   6-15
+  macbook-air: 55/55 tensors
+  gaming-pc: 92/92 tensors
+READY: plan 1 is loaded on 2 node(s)</pre>
+  </div>
+  <div class="stack-lg">
+    <h2>What happens after you paste</h2>
+    <dl class="reads">
+      <div><dt>Laptops find each other</dt><dd>No IP addresses to type. Each laptop announces itself on the local network.</dd></div>
+      <div><dt>Baton measures every laptop</dt><dd>Free memory, GPU, Wi-Fi or cable, and a short speed test.</dd></div>
+      <div><dt>Each laptop loads its own layers</dt><dd>A faster laptop gets more layers. Each one downloads only its share.</dd></div>
+    </dl>
+  </div>
+</div></section>
+
+<section id="how"><div class="wrap">
+  <h2>One answer, passed hand to hand</h2>
+  <div class="ring" role="img" aria-label="Three laptops in a ring. Laptop A holds layers 0 to 5, laptop B layers 6 to 11, laptop C layers 12 to 15 and picks the next word, which returns to laptop A.">
+    <div class="node"><h3>Laptop A</h3><span>layers 0-5</span><span>turns your words into numbers</span></div>
+    <div class="hop">activations</div>
+    <div class="node"><h3>Laptop B</h3><span>layers 6-11</span><span>keeps thinking</span></div>
+    <div class="hop">activations</div>
+    <div class="node"><h3>Laptop C</h3><span>layers 12-15</span><span>picks the next word</span></div>
+  </div>
+  <div class="back">the next word goes back to Laptop A, and the lap starts again</div>
+  <div class="prose">
+    <p>A large model is a tall stack of layers. No single laptop has the memory for all of them, but three laptops together do.</p>
+    <p>Only a small block of numbers crosses the network on each hop. The model weights never leave the laptop that holds them.</p>
+  </div>
+</div></section>
+
+<section id="questions"><div class="wrap">
+  <h2>Before you start</h2>
+  <div class="qa">
+    <details open><summary>What do I need?</summary><p>Two or more laptops on the same Wi-Fi or the same switch. macOS or Windows. The installer brings its own Python.</p></details>
+    <details><summary>Windows asks about the firewall</summary><p>Choose Allow on private networks. The laptops must be able to reach each other, and Windows blocks that by default.</p></details>
+    <details><summary>Does anything leave my network?</summary><p>The model is downloaded from Hugging Face once. Your prompts and answers stay on your laptops.</p></details>
+    <details><summary>Is it fast?</summary><p>It is slower than one large GPU. The point is to run a model that no single laptop can hold.</p></details>
+    <details><summary>Which models work today?</summary><p>Llama 3.2 1B at full precision. Larger models need 4-bit weights, which are in progress.</p></details>
+  </div>
+</div></section>
+</main>
+
+<div class="wrap"><footer>
+  <span>baton</span>
+  <nav aria-label="Footer"><a href="https://github.com/hemalbadola/baton">GitHub</a><a href="#top">Install</a><a href="#questions">Questions</a></nav>
+</footer></div>
+
+
+<script>
+// Full-precision sizes. The 1B is measured from its checkpoint header; the rest are
+// worked out from PRD 3.2 and are not loadable yet.
+const MODELS = [
+  {id:"unsloth/Llama-3.2-1B",               name:"Llama 3.2 1B",  gb:2.3,  ready:true},
+  {id:"meta-llama/Llama-3.1-8B-Instruct",   name:"Llama 3.1 8B",  gb:16,   ready:false},
+  {id:"Qwen/Qwen2.5-32B-Instruct",          name:"Qwen 2.5 32B",  gb:64,   ready:false},
+  {id:"meta-llama/Llama-3.1-70B-Instruct",  name:"Llama 3.1 70B", gb:141,  ready:false},
+];
+const RAW = "https://raw.githubusercontent.com/hemalbadola/baton/main";
+// One line installs and starts: the script runs `baton` with what follows it.
+const COMMAND = {
+  mac: run => `curl -LsSf ${RAW}/install.sh | sh -s -- ${run}`,
+  win: run => `& ([scriptblock]::Create((irm ${RAW}/install.ps1))) ${run}`,
+};
+const $ = id => document.getElementById(id);
+const form = $("config");
+const pick = name => form.elements[name].value;
+
+$("models").innerHTML = MODELS.map((m, i) => `
+  <label class="model"><input type="radio" name="model" value="${m.id}" ${i ? "" : "checked"} ${m.ready ? "" : "disabled"}>
+    <span><b>${m.name}</b></span><span class="fit" data-gb="${m.gb}" data-ready="${m.ready}"></span></label>`).join("");
+
+function render(){
+  const os = pick("os"), role = pick("role"), mem = Math.max(0, Number($("mem").value) || 0);
+  const model = MODELS.find(m => m.id === pick("model"));
+  // The planner keeps 20% of every laptop for the conversation memory.
+  const room = mem * 0.8;
+  document.querySelectorAll(".fit").forEach(el => {
+    const gb = Number(el.dataset.gb), ok = room >= gb;
+    el.className = "fit " + (el.dataset.ready !== "true" ? "off" : ok ? "ok" : "no");
+    el.textContent = el.dataset.ready !== "true" ? `${gb} GB, not ready yet` : ok ? `${gb} GB, fits` : `needs ${Math.ceil(gb / 0.8 - mem)} GB more`;
+  });
+  $("model-field").hidden = role === "join";
+  $("shell").textContent = os === "win" ? "PowerShell" : "Terminal";
+  $("role-hint").textContent = role === "start" ? "Do this on one laptop only. It also joins as the first worker." : "Do this on every other laptop. No model to pick: the first laptop decides.";
+  const run = role === "start" ? `serve --model ${model.id} --quant none --min-workers 2` : "worker";
+  const command = COMMAND[os](run), box = $("cmd");
+  if (box.textContent && box.textContent !== command) { box.classList.remove("flash"); void box.offsetWidth; box.classList.add("flash"); }
+  box.textContent = command;
+  $("note").textContent = role === "start" && room < model.gb ? `${model.name} needs more memory than ${mem} GB. Baton will wait until more laptops join.` : "";
+}
+const detected = /Win/i.test(navigator.userAgent) ? "win" : "mac";
+form.elements.os.value = detected;
+form.addEventListener("input", render);
+render();
+
+document.querySelectorAll("[data-copy]").forEach(btn => btn.addEventListener("click", async () => {
+  const text = $("cmd").textContent;
+  try { await navigator.clipboard.writeText(text); }
+  catch { const r = document.createRange(); r.selectNodeContents($("cmd")); const s = getSelection(); s.removeAllRanges(); s.addRange(r); document.execCommand("copy"); }
+  const was = btn.textContent; btn.textContent = "Copied";
+  setTimeout(() => btn.textContent = was, 1600);
+}));
+</script>
+</body>
+</html>
