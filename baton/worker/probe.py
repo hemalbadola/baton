@@ -8,9 +8,16 @@ control loop can call it at any time without touching the compute thread.
 
 from __future__ import annotations
 
+import re
+import shutil
+import statistics
+import subprocess
+import sys
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 Backend = Literal["cuda", "mps", "cpu"]
 LinkKind = Literal["wifi", "wired", "unknown"]
@@ -22,6 +29,18 @@ OS_RESERVE_BYTES: dict[Backend, int] = {
     "mps": 2 * 1024**3,
     "cpu": 3 * 1024**3 // 2,
 }
+
+#: Compute dtype names as they travel in `caps` and `bench`, and the torch
+#: attribute each one names.
+_TORCH_DTYPES = {"bf16": "bfloat16", "fp16": "float16", "fp32": "float32"}
+
+# PRD 6.3 benchmark shape.
+BENCH_CACHE_TOKENS = 512
+BENCH_WARMUP_STEPS = 5
+BENCH_DECODE_STEPS = 30
+BENCH_PREFILL_PASSES = 5
+
+_now = time.perf_counter  # a module name, so a test can drive the clock
 
 
 @dataclass(slots=True, frozen=True)
@@ -61,6 +80,30 @@ class Capabilities:
     bench: BenchResult | None = None
 
 
+def torch_dtype(name: str) -> Any:
+    """The torch dtype for a wire name such as `bf16`."""
+    import torch
+
+    return getattr(torch, _TORCH_DTYPES[name])
+
+
+def dtype_name(dtype: object) -> str:
+    """Inverse of `torch_dtype`."""
+    return next(k for k, v in _TORCH_DTYPES.items() if str(dtype) == f"torch.{v}")
+
+
+def _safe(probe: Callable[[], Any], default: Any) -> Any:
+    """Run one sub-probe. A failure is an answer, never a lost `hello`."""
+    try:
+        return probe()
+    except Exception:  # noqa: BLE001 - any failure means "unknown", by design
+        return default
+
+
+def _run(cmd: list[str]) -> str:
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=2, check=True).stdout
+
+
 def pick_device(requested: str = "auto") -> Backend:
     """Resolve `--device` to a concrete backend (PRD 6.1 step 1).
 
@@ -69,7 +112,15 @@ def pick_device(requested: str = "auto") -> Backend:
     backend that is absent must see the failure from the first allocation, not
     a silent downgrade to CPU.
     """
-    raise NotImplementedError
+    if requested != "auto":
+        return requested  # type: ignore[return-value]
+    import torch
+
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
 
 
 def memory_total_free(backend: Backend) -> tuple[int, int]:
@@ -79,27 +130,69 @@ def memory_total_free(backend: Backend) -> tuple[int, int]:
     maximum rather than a true free figure, so the free value is clamped by the
     host free memory from `psutil`: unified memory is shared with the OS.
     """
-    raise NotImplementedError
+    import psutil
+    import torch
+
+    if backend == "cuda":
+        free, total = torch.cuda.mem_get_info()
+        return total, free
+    host = psutil.virtual_memory()
+    if backend == "mps":
+        total = torch.mps.recommended_max_memory()
+        free = total - torch.mps.current_allocated_memory()
+        return total, max(0, min(free, host.available))
+    return host.total, host.available
 
 
 def int4_fast_path(backend: Backend) -> bool:
-    """Test `torch._weight_int4pack_mm` on a 64x64 tensor.
+    """True when the packed int4 kernel exists here AND matches the reference.
 
+    The check itself is `quant.int4_fast_ok`: availability is not correctness.
     Any exception means no fast path. The probe must never raise: a missing
     kernel is a capability answer, not an error.
     """
-    raise NotImplementedError
+
+    def check() -> bool:
+        from baton.model import quant
+
+        return bool(quant.int4_fast_ok(backend, quant.compute_dtype(backend)))
+
+    return _safe(check, False)
 
 
 def detect_link() -> LinkKind:
     """Classify the default route interface as wireless or wired.
 
-    Best effort per platform: `networksetup` on macOS, `iw` on Linux, `netsh`
-    on Windows. Returns `unknown` when the tool is absent or the output does
-    not parse. The planner treats `unknown` as `wifi` because that is the
-    pessimistic case.
+    Best effort per platform: `route` plus `networksetup` on macOS, `ip` plus
+    sysfs on Linux, `netsh` on Windows. Returns `unknown` when the tool is
+    absent or the output does not parse: a wrong answer skews every hop the
+    planner predicts, so no answer is better. The planner treats `unknown` as
+    `wifi` because that is the pessimistic case.
     """
-    raise NotImplementedError
+
+    def classify() -> LinkKind:
+        if sys.platform == "darwin":
+            iface = re.search(r"interface:\s*(\S+)", _run(["route", "-n", "get", "default"]))
+            ports = _run(["networksetup", "-listallhardwareports"])
+            port = re.search(rf"Hardware Port: ([^\n]+)\nDevice: {re.escape(iface[1])}\n", ports)
+            return "wifi" if re.search(r"wi-?fi|airport", port[1], re.IGNORECASE) else "wired"
+        if sys.platform.startswith("linux"):
+            iface = re.search(r"\bdev\s+(\S+)", _run(["ip", "route", "show", "default"]))
+            return "wifi" if Path(f"/sys/class/net/{iface[1]}/wireless").exists() else "wired"
+        if sys.platform == "win32":
+            # ponytail: matches English `netsh` output only, and a machine with
+            # Wi-Fi and Ethernet both up reads as wifi. Parse `Get-NetRoute` if
+            # that bites.
+            out = _run(["netsh", "wlan", "show", "interfaces"])
+            return (
+                "wifi"
+                if re.search(r"^\s*State\s*:\s*connected", out, re.IGNORECASE | re.MULTILINE)
+                else "wired"
+            )
+        return "unknown"
+
+    # A failed match subscripts None and lands here as `unknown`.
+    return _safe(classify, "unknown")
 
 
 def probe_capabilities(
@@ -116,17 +209,62 @@ def probe_capabilities(
     the head asks for a refresh. `bench` is carried through unchanged: the
     benchmark is run separately, on demand, and is not part of the probe.
     """
-    raise NotImplementedError
+    from baton.model import quant
+
+    def disk_free() -> int:
+        path = cache_dir
+        while not path.exists() and path != path.parent:
+            path = path.parent
+        return shutil.disk_usage(path).free
+
+    total, free = _safe(lambda: memory_total_free(backend), (0, 0))
+    return Capabilities(
+        backend=backend,
+        compute_dtype=_safe(lambda: dtype_name(quant.compute_dtype(backend)), "fp32"),
+        mem_total_bytes=total,
+        mem_free_bytes=free,
+        disk_free_bytes=_safe(disk_free, 0),
+        int4_fast_path=int4_fast_path(backend),
+        link=detect_link(),
+        bench=bench,
+    )
 
 
 def memory_budget(backend: Backend, max_mem_bytes: int | None = None) -> MemoryBudget:
-    """Compute the memory budget (PRD 6.3).
+    """Compute the memory budget (PRD 6.3, as corrected by BAT-8 and BAT-23).
 
-    `usable_bytes = min(mem_free_bytes, max_mem_bytes) - OS_RESERVE_BYTES[backend]`,
-    floored at zero. `--max-mem` lets a 64 GB machine simulate a 4 GB one and
-    lets a user keep memory for other work.
+    The ceiling is `mem_total_bytes - OS_RESERVE_BYTES[backend]`. Without
+    `--max-mem` the worker offers its free memory up to that ceiling. With it,
+    the worker offers what the user said, up to the same ceiling: the flag lets
+    a 64 GB machine simulate a 4 GB one, and lets the owner of an 8 GB laptop
+    promise memory that a browser holds right now.
+
+    PRD 6.3 takes the reserve off the free figure. Free memory already leaves
+    out what the OS and every open app hold, so that counts the reserve twice:
+    a real 8 GB Mac with 1.3 GB free came out at zero bytes.
     """
-    raise NotImplementedError
+    total, free = memory_total_free(backend)
+    ceiling = total - OS_RESERVE_BYTES[backend]
+    usable = min(free if max_mem_bytes is None else max_mem_bytes, ceiling)
+    return MemoryBudget(mem_total_bytes=total, mem_free_bytes=free, usable_bytes=max(0, usable))
+
+
+class _BenchKV:
+    """A one-layer KV cache preloaded with random rows (PRD 6.3 step 2)."""
+
+    def __init__(self, spec: Any, max_len: int, filled: int, device: Any, dtype: Any) -> None:
+        import torch
+
+        shape = (max_len, spec.n_kv_heads, spec.head_dim)
+        self.k = torch.randn(shape).to(device=device, dtype=dtype)
+        self.v = torch.randn(shape).to(device=device, dtype=dtype)
+        self.length = filled
+
+    def append(self, k: Any, v: Any, pos_start: int) -> tuple[Any, Any]:
+        self.length = pos_start + k.shape[0]
+        self.k[pos_start : self.length] = k
+        self.v[pos_start : self.length] = v
+        return self.k[: self.length], self.v[: self.length]
 
 
 def run_bench(
@@ -145,7 +283,61 @@ def run_bench(
     for several seconds and would stall every heartbeat if it ran inline.
     Budget is under 10 s on any device.
 
-    `spec` is the model spec owned by the kernels lane (PRD 5.1). It stays
-    loosely typed here so this module does not import that lane.
+    `spec` is a `ModelSpec`, or its `to_dict()` form as it arrives in `bench`.
     """
-    raise NotImplementedError
+    import gc
+
+    import torch
+
+    from baton.model.layers import DecoderLayer, build_rope_tables
+    from baton.model.spec import ModelSpec
+    from baton.worker.engine import CHUNK_TOKENS
+
+    if isinstance(spec, dict):
+        spec = ModelSpec(**spec)
+    device = torch.device(backend)
+    dtype = torch_dtype(compute_dtype)
+    max_len = BENCH_CACHE_TOKENS + BENCH_WARMUP_STEPS + BENCH_DECODE_STEPS
+
+    def sync() -> None:
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        elif device.type == "mps":
+            torch.mps.synchronize()
+
+    def measure() -> tuple[list[float], list[float]]:
+        # Every tensor is a local of this function, so all of it is garbage the
+        # moment it returns (PRD 6.3 step 5).
+        # ponytail: a dense layer for every tier. The decoder has no quantized
+        # matmul yet (BAT-10), so `quant` is echoed back, not exercised.
+        layer = DecoderLayer(spec, device=device, dtype=dtype).eval()
+        cos, sin = build_rope_tables(spec, max_len, device=device)
+        cache = _BenchKV(spec, max_len, BENCH_CACHE_TOKENS, device, dtype)
+
+        def timed_ms(x: torch.Tensor, pos: int) -> float:
+            rows = slice(pos, pos + x.shape[0])
+            sync()
+            start = _now()
+            layer(x, cos[rows], sin[rows], pos, cache)
+            sync()
+            return (_now() - start) * 1000.0
+
+        token = torch.randn(1, spec.hidden).to(device=device, dtype=dtype)
+        chunk = torch.randn(CHUNK_TOKENS, spec.hidden).to(device=device, dtype=dtype)
+        steps = range(BENCH_WARMUP_STEPS + BENCH_DECODE_STEPS)
+        decode = [timed_ms(token, BENCH_CACHE_TOKENS + i) for i in steps][BENCH_WARMUP_STEPS:]
+        return decode, [timed_ms(chunk, 0) for _ in range(BENCH_PREFILL_PASSES)]
+
+    with torch.inference_mode():
+        decode, prefill = measure()
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    elif device.type == "mps":
+        torch.mps.empty_cache()
+    return BenchResult(
+        t_dec_ms=statistics.median(decode),
+        t_pre_ms=statistics.median(prefill),
+        quant=quant,
+        dtype=compute_dtype,
+    )
