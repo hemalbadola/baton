@@ -318,6 +318,25 @@ class RangeSource:
 # --------------------------------------------------------------------------- #
 
 
+def open_source(model: str, token: str | None = None, revision: str = "main") -> ByteSource:
+    """The byte source for `model`: a checkpoint directory, or a Hugging Face repo id.
+
+    A head and its workers call this with the same string, so a directory only
+    works when every machine has the checkpoint at that same path.
+    """
+    if Path(model).is_dir():
+        return LocalSource(model)
+    return RangeSource(f"https://huggingface.co/{model}/resolve/{revision}", token=token)
+
+
+def fetch_header(source: ByteSource, file: str) -> tuple[dict, int]:
+    """Read one shard's JSON header through a byte source: two small ranged reads."""
+    (header_len,) = struct.unpack("<Q", source.fetch(file, 0, HEADER_LEN_BYTES))
+    if header_len == 0 or header_len > MAX_HEADER_BYTES:
+        raise SafetensorsError(f"{file}: implausible header length {header_len}")
+    return parse_header(source.fetch(file, 0, HEADER_LEN_BYTES + header_len))
+
+
 def slice_tensor(blob: bytes | bytearray, blob_start: int, ref: TensorRef) -> torch.Tensor:
     """Cut one tensor out of a fetched span. ``blob_start`` is the span's file offset."""
     lo = ref.start - blob_start

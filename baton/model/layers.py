@@ -398,21 +398,29 @@ class DecoderStack(nn.Module):
 
     # --- weights ---------------------------------------------------------
 
+    def checkpoint_keys(self) -> dict[str, str]:
+        """Map each `state_dict` key of this stack to its checkpoint tensor name.
+
+        Two keys share one name when the head is tied to the embedding.
+        """
+        spec = self.spec
+        keys: dict[str, str] = {}
+        for local, absolute in enumerate(range(self.layer_start, self.layer_end)):
+            for key, name in spec.layer_names(absolute).items():
+                keys[f"layers.{local}.{_LOCAL_SUFFIX[key]}"] = name
+        if self.embed_tokens is not None:
+            keys["embed_tokens.weight"] = spec.tensor_names["embed"]
+        if self.norm is not None:
+            names = spec.head_names()
+            keys["norm.weight"] = names["final_norm"]
+            keys["lm_head.weight"] = names["lm_head"]
+        return keys
+
     def load_hf_weights(self, tensors: dict[str, Tensor]) -> None:
         """Copy Hugging Face checkpoint tensors into this stack.
 
         `tensors` is keyed by checkpoint name. Only the tensors this shard owns
         need to be present.
         """
-        spec = self.spec
-        state: dict[str, Tensor] = {}
-        for local, absolute in enumerate(range(self.layer_start, self.layer_end)):
-            for key, name in spec.layer_names(absolute).items():
-                state[f"layers.{local}.{_LOCAL_SUFFIX[key]}"] = tensors[name]
-        if self.embed_tokens is not None:
-            state["embed_tokens.weight"] = tensors[spec.tensor_names["embed"]]
-        if self.norm is not None:
-            names = spec.head_names()
-            state["norm.weight"] = tensors[names["final_norm"]]
-            state["lm_head.weight"] = tensors[names["lm_head"]]
+        state = {key: tensors[name] for key, name in self.checkpoint_keys().items()}
         self.load_state_dict(state, strict=True)

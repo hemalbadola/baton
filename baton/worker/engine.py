@@ -11,13 +11,17 @@ takes finished frames off `outbox`. See the design note in memory.md.
 from __future__ import annotations
 
 import queue
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Protocol
 
-if TYPE_CHECKING:  # transport lane (PRD 8); imported for types only
+if TYPE_CHECKING:  # imported for types only
     import torch
 
     from baton.common.messages import Frame
+    from baton.model.layers import DecoderStack
+    from baton.model.safetensors_io import ByteSource
+    from baton.model.spec import ModelSpec
 
 JobKind = Literal["prompt", "next", "act", "release", "abort", "bench"]
 
@@ -42,6 +46,94 @@ class OutOfMemoryOnKV(Exception):
         self.req = req
         self.requested_bytes = requested_bytes
         self.available_bytes = available_bytes
+
+
+class ShardTooLarge(Exception):
+    """The shard does not fit the memory budget. The daemon reports `error{code="oom"}`."""
+
+
+def load_shard(
+    spec: ModelSpec,
+    first_layer: int,
+    last_layer: int,
+    *,
+    embed: bool,
+    head: bool,
+    source: ByteSource,
+    index: Mapping[str, str],
+    ctx_max: int,
+    device: str,
+    dtype: torch.dtype,
+    budget_bytes: int | None = None,
+    on_progress: Callable[[int, int, int], None] | None = None,
+) -> tuple[DecoderStack, int]:
+    """Fetch one layer range and build the resident stack (PRD 5.3, 6.4 steps 2-3).
+
+    `[first_layer, last_layer]` is inclusive, as it travels in `load`. One
+    tensor at a time: each is fetched, checked, copied into its place and
+    dropped, so peak memory is the stack plus the largest tensor. Returns the
+    stack and its resident bytes.
+
+    `on_progress(done, total, bytes)` is called from this thread after every
+    tensor. The size is checked against `budget_bytes` before anything is
+    allocated, because a laptop that swaps is worse than one that says no.
+
+    ponytail: dense weights in the compute dtype, fetched on every load. The
+    quantized tiers are BAT-10; the shard cache and the memmapped embedding
+    table are BAT-11.
+    """
+    import torch
+
+    from baton.model import safetensors_io as sio
+    from baton.model.layers import DecoderStack
+
+    names = spec.range_names(first_layer, last_layer + 1, embed=embed, head=head)
+    missing = [name for name in names if name not in index]
+    if missing:
+        raise KeyError(f"index names no file for {missing[0]!r} ({len(missing)} missing)")
+    headers = {file: sio.fetch_header(source, file) for file in sorted({index[n] for n in names})}
+    refs = sio.resolve(index, headers, names)
+
+    need = sum(ref.numel() for ref in refs) * torch.empty((), dtype=dtype).element_size()
+    if budget_bytes is not None and need > budget_bytes:
+        raise ShardTooLarge(f"shard needs {need} bytes, the budget is {budget_bytes}")
+
+    stack = DecoderStack(
+        spec,
+        first_layer,
+        last_layer + 1,
+        embed=embed,
+        head=head,
+        max_ctx=ctx_max,
+        device=device,
+        dtype=dtype,
+    )
+    state = stack.state_dict()
+    slots: dict[str, list[torch.Tensor]] = {}
+    for key, name in stack.checkpoint_keys().items():
+        slots.setdefault(name, []).append(state[key])
+
+    done = fetched = 0
+    with torch.no_grad():
+        # `max_gap=-1` turns coalescing off. Tensors sit back to back in a shard
+        # file, so any gap allowance merges the whole layer range into one
+        # multi-GB read held beside the stack (PRD 5.3 step 5).
+        for name, tensor in sio.iter_tensors(refs, source, max_gap=-1):
+            for slot in slots[name]:
+                # `copy_` broadcasts, so a wrong-shaped tensor would load silently.
+                if slot.shape != tensor.shape:
+                    raise ValueError(
+                        f"{name}: checkpoint shape {tuple(tensor.shape)}, "
+                        f"model wants {tuple(slot.shape)}"
+                    )
+                slot.copy_(tensor)
+            done += 1
+            fetched += tensor.numel() * tensor.element_size()
+            if on_progress is not None:
+                on_progress(done, len(refs), fetched)
+
+    resident = sum(t.numel() * t.element_size() for t in (*stack.parameters(), *stack.buffers()))
+    return stack.eval(), resident
 
 
 @dataclass(slots=True)
