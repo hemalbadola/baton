@@ -255,11 +255,12 @@ def format_plan(plan_: Plan) -> str:
         f"objective={plan_.objective} kv_fraction={plan_.kv_fraction:.2f} "
         f"guaranteed_ctx={plan_.guaranteed_ctx}"
     )
-    lines = [header, f"{'Device':<12}{'Role':<8}{'Layers':<12}{'Stage ms':>10}"]
+    wide = max([12, *(len(a.name) + 2 for a in plan_.assignments)])
+    lines = [header, f"{'Device':<{wide}}{'Role':<8}{'Layers':<12}{'Stage ms':>10}"]
     for a in plan_.assignments:
         role = f"{a.role}=Nk" if a.holds_lm_head else a.role
         span = f"{a.first_layer}-{a.last_layer}"
-        lines.append(f"{a.name:<12}{role:<8}{span:<12}{a.stage_ms:>10.1f}")
+        lines.append(f"{a.name:<{wide}}{role:<8}{span:<12}{a.stage_ms:>10.1f}")
     lines.append(
         f"per-token {plan_.token_ms:.1f} ms "
         f"({len(plan_.assignments)} hops {plan_.hop_ms:.1f} ms) "

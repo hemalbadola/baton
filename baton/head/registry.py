@@ -16,6 +16,7 @@ proves the process is alive and proves nothing about the shard.
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -51,6 +52,7 @@ class Capabilities:
     t_pre_ms: float
     int4_fast_path: bool = False
     link: str = "unknown"
+    compute_dtype: str = "bf16"
 
     @classmethod
     def from_caps(cls, caps: dict[str, Any]) -> Capabilities:
@@ -78,6 +80,7 @@ class Capabilities:
             t_pre_ms=_as_float(bench.get("t_pre_ms")),
             int4_fast_path=bool(caps.get("int4_fast_path", False)),
             link=str(caps.get("link", "unknown")),
+            compute_dtype=str(caps.get("compute_dtype", "bf16")),
         )
 
 
@@ -218,12 +221,17 @@ class Registry:
         worker.last_seen = health.at
 
     def on_bench(self, name: str, t_dec_ms: float, t_pre_ms: float) -> None:
-        """Record a `bench_result` reply. These two numbers drive the planner."""
+        """Record a `bench_result` reply. These two numbers drive the planner.
+
+        A timing that is not a finite positive number is dropped: NaN passes
+        every comparison the planner makes and then breaks its arithmetic.
+        """
         worker = self.workers.get(name)
-        if worker is None:
+        dec, pre = _as_float(t_dec_ms), _as_float(t_pre_ms)
+        if worker is None or not (0 < dec < math.inf and 0 < pre < math.inf):
             return
-        worker.capabilities.t_dec_ms = float(t_dec_ms)
-        worker.capabilities.t_pre_ms = float(t_pre_ms)
+        worker.capabilities.t_dec_ms = dec
+        worker.capabilities.t_pre_ms = pre
 
     def timed_out(self, now: float) -> list[Worker]:
         """Workers with no `health` frame for `HEALTH_TIMEOUT_S` (PRD 7.6).
@@ -330,8 +338,9 @@ class Registry:
 
     def roster_table(self) -> str:
         """The joined-worker table that `baton serve` prints (PRD 7.1 step 5)."""
+        wide = max([16, *(len(name) for name in self.workers)])
         header = (
-            f"{'NAME':<16} {'STATE':<8} {'BACKEND':<8} {'USABLE':>9} "
+            f"{'NAME':<{wide}} {'STATE':<8} {'BACKEND':<8} {'USABLE':>9} "
             f"{'t_dec':>8} {'t_pre':>8} {'LAYERS':>10}"
         )
         lines = [header, "-" * len(header)]
@@ -341,7 +350,7 @@ class Registry:
             if w.holds_lm_head and w.layers:
                 span += "*"
             lines.append(
-                f"{w.name:<16} {w.state:<8} {caps.backend:<8} "
+                f"{w.name:<{wide}} {w.state:<8} {caps.backend:<8} "
                 f"{caps.usable_bytes / 1024**3:>8.1f}G "
                 f"{caps.t_dec_ms:>8.3f} {caps.t_pre_ms:>8.3f} {span:>10}"
             )
@@ -352,7 +361,7 @@ def _as_int(value: Any) -> int:
     """Coerce one wire value to int. A bad value is 0, never an exception."""
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # OverflowError: JSON `Infinity`
         return 0
 
 
