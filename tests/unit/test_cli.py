@@ -50,7 +50,9 @@ def test_body_is_not_implemented_yet(argv):
 
 def test_serve_refuses_a_quant_tier_that_cannot_load_yet():
     """int4 is the PRD default and is not wired into the decoder (BAT-10)."""
-    result = runner.invoke(app, ["serve", "--model", "some/model", "--no-local-worker"])
+    result = runner.invoke(
+        app, ["serve", "--model", "some/model", "--no-local-worker", "--quant", "int4"]
+    )
     assert result.exit_code == 1
     assert "--quant none" in click.unstyle(result.output)
 

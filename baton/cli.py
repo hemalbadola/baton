@@ -88,6 +88,32 @@ def root(
         level="DEBUG" if verbose else "ERROR" if quiet else "INFO",
         format="%(asctime)s %(name)s: %(message)s",
     )
+    # One INFO line per HTTP request would bury the head's own output.
+    for noisy in ("httpx", "huggingface_hub"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+@app.command(name="app")
+def open_app(
+    name: Annotated[
+        str | None,
+        typer.Option("--name", envvar="BATON_NAME", help="Name shown to nearby laptops."),
+    ] = None,
+    port: Annotated[
+        int, typer.Option("--port", envvar="BATON_APP_PORT", help="Port of the local page.")
+    ] = 7800,
+    browser: Annotated[
+        bool, typer.Option("--browser/--no-browser", help="Open the page in the browser.")
+    ] = True,
+) -> None:
+    """Open the page: find nearby laptops, host a model or join one, chat. No other command."""
+    import asyncio
+    import contextlib
+
+    from baton.agent import run_agent
+
+    with contextlib.suppress(KeyboardInterrupt, asyncio.CancelledError):
+        asyncio.run(run_agent(name, port, browser))
 
 
 @app.command()
@@ -171,7 +197,7 @@ def serve(
     ] = 8192,
     quant: Annotated[
         Quant, typer.Option("--quant", envvar="BATON_QUANT", help="Weight quantization at load.")
-    ] = Quant.int4,
+    ] = Quant.none,  # int8 and int4 do not load yet (BAT-10)
     objective: Annotated[
         Objective, typer.Option("--objective", envvar="BATON_OBJECTIVE", help="Planner objective.")
     ] = Objective.latency,
@@ -216,6 +242,8 @@ def serve(
         kv_fraction=0.2 if kv_fraction is None else kv_fraction,
         min_workers=min_workers,
         wait_s=wait,
+        http=True,
+        dashboard=dashboard,
     )
     try:
         asyncio.run(head.serve(options))

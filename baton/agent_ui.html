@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Baton</title>
+<style>
+:root { --bg:#0f1115; --panel:#171a21; --line:#262b35; --text:#e6e8ec; --muted:#8b93a1;
+        --accent:#6ea8fe; --ok:#7cc47f; --warn:#e0a458; --bad:#e06c75; color-scheme: dark; }
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--text);
+       font:15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { display:flex; align-items:center; gap:14px; padding:12px 20px; border-bottom:1px solid var(--line); }
+.brand { font-weight:700; letter-spacing:.04em; }
+.pill { padding:2px 9px; border-radius:99px; font-size:12px; border:1px solid var(--line); color:var(--muted); }
+.pill.on { color:var(--ok); border-color:var(--ok); }
+main { max-width:880px; margin:0 auto; padding:24px 20px 60px; display:grid; gap:18px; }
+section { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px 18px; }
+h2 { margin:0 0 10px; font-size:13px; letter-spacing:.08em; text-transform:uppercase; color:var(--muted); font-weight:600; }
+.muted { color:var(--muted); font-size:13px; }
+.row { display:flex; align-items:center; gap:12px; padding:10px 0; border-top:1px solid var(--line); }
+.row:first-of-type { border-top:0; }
+.row .grow { flex:1; }
+.dot { width:9px; height:9px; border-radius:50%; background:var(--muted); }
+.dot.idle { background:var(--ok); } .dot.lobby, .dot.hosting { background:var(--accent); } .dot.joined { background:var(--warn); }
+button { font:inherit; cursor:pointer; border-radius:8px; border:1px solid var(--line); background:#1d212a;
+         color:var(--text); padding:7px 14px; }
+button.primary { background:var(--accent); border-color:var(--accent); color:#0b0d12; font-weight:600; }
+button.danger { color:var(--bad); }
+button:disabled { opacity:.45; cursor:default; }
+select, input[type=text] { font:inherit; background:#0f1115; color:var(--text); border:1px solid var(--line);
+         border-radius:8px; padding:8px 10px; width:100%; }
+.invite { border-color:var(--accent); }
+.big { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
+.big > * { flex:1 1 220px; }
+table { width:100%; border-collapse:collapse; }
+td, th { text-align:left; padding:6px 8px; border-top:1px solid var(--line); font-size:14px; }
+th { color:var(--muted); font-weight:500; font-size:12px; }
+.num { text-align:right; font-variant-numeric:tabular-nums; }
+#transcript { display:flex; flex-direction:column; gap:12px; margin-bottom:12px; max-height:360px; overflow:auto; }
+.msg { border-left:2px solid var(--line); padding-left:10px; white-space:pre-wrap; }
+.msg.assistant { border-left-color:var(--accent); }
+form.compose { display:flex; gap:8px; }
+details pre { margin:8px 0 0; padding:10px; background:#0f1115; border-radius:8px; overflow:auto;
+              font-size:12px; max-height:240px; color:var(--muted); }
+[hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<header>
+  <span class="brand">baton</span>
+  <span class="pill" id="who"></span>
+  <span class="pill" id="state"></span>
+  <span style="margin-left:auto" class="muted" id="mem"></span>
+</header>
+
+<main>
+  <div id="error" class="muted" style="color:var(--bad)" hidden></div>
+
+  <section id="invites" hidden><h2>Invitations</h2><div id="invite-list"></div></section>
+
+  <section id="home" hidden>
+    <h2>Start</h2>
+    <div class="big">
+      <div>
+        <div class="muted" style="margin-bottom:6px">Model</div>
+        <select id="model"></select>
+      </div>
+      <button class="primary" id="host">Host this model</button>
+    </div>
+    <p class="muted" style="margin-bottom:0">Or wait: the laptop that hosts will invite this one. An invitation shows up above.</p>
+  </section>
+
+  <section id="lobby" hidden>
+    <h2>Your room</h2>
+    <div><b id="room-model"></b> <span class="muted" id="room-count"></span></div>
+    <p class="muted">Invite the laptops that you want. Each person clicks Accept. Then press Start.</p>
+    <div class="big" style="margin-top:12px">
+      <button class="primary" id="start">Start</button>
+      <button class="danger" id="cancel">Cancel</button>
+    </div>
+  </section>
+
+  <section id="nearby-box">
+    <h2>Nearby laptops</h2>
+    <div id="nearby"></div>
+    <div class="muted" id="nearby-empty">Looking. Open Baton on the other laptops, on the same Wi-Fi.</div>
+  </section>
+
+  <section id="cluster" hidden>
+    <h2 id="cluster-title">Cluster</h2>
+    <div class="muted" id="cluster-line"></div>
+    <table id="nodes" hidden>
+      <thead><tr><th>laptop</th><th>role</th><th>layers</th><th class="num">compute</th><th>state</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div style="margin-top:14px"><button class="danger" id="stop">Stop</button></div>
+  </section>
+
+  <section id="chat" hidden>
+    <h2>Chat</h2>
+    <div id="transcript"></div>
+    <form class="compose" id="compose">
+      <input type="text" id="text" placeholder="Ask the cluster something" autocomplete="off">
+      <button class="primary" id="send" type="submit" style="flex:0 0 auto">Send</button>
+    </form>
+  </section>
+
+  <details><summary class="muted">Details</summary><pre id="log"></pre></details>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const show = (id, on) => $(id).hidden = !on;
+const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+let me = null, peers = [], cluster = null, busy = false;
+const history = [];
+
+async function call(path, body) {
+  const res = await fetch(path, body === undefined ? {} : {
+    method: "POST", headers: {"content-type": "application/json"}, body: JSON.stringify(body) });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  return data;
+}
+function fail(err) { const e = $("error"); e.textContent = String(err.message || err); e.hidden = false;
+  setTimeout(() => e.hidden = true, 6000); }
+const act = (path, body) => call(path, body).then(refresh).catch(fail);
+
+async function refresh() {
+  try { me = await call("/api/me"); peers = await call("/api/peers"); } catch (e) { return; }
+  cluster = null;
+  if (me.state === "hosting" || me.state === "joined") {
+    try { cluster = await call("/cluster"); } catch (e) { cluster = null; }
+  }
+  render();
+}
+
+function render() {
+  $("who").textContent = me.name;
+  $("state").textContent = {idle:"ready", lobby:"your room", hosting:"hosting", joined:"joined"}[me.state];
+  $("state").className = "pill" + (me.state === "idle" ? "" : " on");
+  $("mem").textContent = `${me.backend} · ${me.usable_gb} GB free`;
+
+  show("invites", me.invites.length > 0 && me.state === "idle");
+  $("invite-list").innerHTML = me.invites.map(i => `
+    <div class="row invite"><div class="grow"><b>${esc(i.from)}</b> invites you to run
+      <b>${esc(i.model)}</b></div>
+      <button class="primary" data-accept="${i.id}">Accept</button>
+      <button data-decline="${i.id}">Decline</button></div>`).join("");
+
+  show("home", me.state === "idle");
+  if (!$("model").options.length) {
+    $("model").innerHTML = me.models.map(m => `<option value="${esc(m.id)}">${esc(m.name)} (${m.gb} GB)</option>`).join("");
+  }
+  show("lobby", me.state === "lobby");
+  if (me.room) {
+    $("room-model").textContent = me.room.model;
+    $("room-count").textContent = `${me.room.accepted.length} accepted, ${me.room.invited.length} waiting`;
+  }
+
+  show("nearby-box", me.state === "idle" || me.state === "lobby");
+  $("nearby-empty").hidden = peers.length > 0;
+  $("nearby").innerHTML = peers.map(p => {
+    const accepted = me.room && me.room.accepted.includes(p.name);
+    const waiting = me.room && me.room.invited.includes(p.name);
+    const can = me.state === "lobby" && p.state === "idle";
+    const note = accepted ? "accepted" : waiting ? "invited, waiting" : p.state === "idle" ? "ready" : p.state;
+    return `<div class="row"><span class="dot ${p.state}"></span>
+      <div class="grow"><b>${esc(p.name)}</b> <span class="muted">${esc(note)}</span></div>
+      ${can && !accepted ? `<button data-invite="${esc(p.name)}">${waiting ? "Invite again" : "Invite"}</button>` : ""}
+      </div>`;
+  }).join("");
+
+  const running = me.state === "hosting" || me.state === "joined";
+  show("cluster", running);
+  if (running) {
+    $("cluster-title").textContent = me.state === "hosting" ? "Your cluster" : `Joined ${me.joined ? me.joined.host : ""}`;
+    const c = cluster;
+    $("cluster-line").textContent = !c ? "Starting. The first start downloads the model, which takes a few minutes."
+      : `${c.state} · ${c.model ? c.model.id : ""} · ${c.live.tok_s.toFixed(1)} tok/s · first token ${Math.round(c.live.ttft_ms)} ms`;
+    show("nodes", !!c && c.nodes.length > 0);
+    if (c) $("nodes").querySelector("tbody").innerHTML = c.nodes.map(n => `<tr>
+      <td>${esc(n.name)}</td><td>${esc(n.role)}</td><td>${n.layers[0]}–${n.layers[1]}</td>
+      <td class="num">${n.stage_ms.p50.toFixed(1)} ms</td><td>${esc(n.state)}</td></tr>`).join("");
+  }
+  const ready = !!cluster && (cluster.state === "READY" || cluster.state === "SERVING");
+  show("chat", running && ready);
+  $("log").textContent = me.log.join("\n");
+}
+
+document.addEventListener("click", e => {
+  const t = e.target;
+  if (t.dataset.accept) act("/api/accept", {id: t.dataset.accept});
+  if (t.dataset.decline) act("/api/decline", {id: t.dataset.decline});
+  if (t.dataset.invite) act("/api/invite", {peer: t.dataset.invite});
+});
+$("host").onclick = () => act("/api/room", {model: $("model").value});
+$("start").onclick = () => act("/api/start", {});
+$("cancel").onclick = () => act("/api/stop", {});
+$("stop").onclick = () => { history.length = 0; $("transcript").innerHTML = ""; act("/api/stop", {}); };
+
+$("compose").onsubmit = async e => {
+  e.preventDefault();
+  const content = $("text").value.trim();
+  if (!content || busy) return;
+  busy = true; $("send").disabled = true; $("text").value = "";
+  history.push({role: "user", content});
+  const add = (role, text) => {
+    const d = document.createElement("div"); d.className = "msg " + role; d.textContent = text;
+    $("transcript").appendChild(d); $("transcript").scrollTop = 1e9; return d;
+  };
+  add("user", content);
+  const box = add("assistant", "");
+  let reply = "";
+  try {
+    const res = await fetch("/v1/chat/completions", {method: "POST",
+      headers: {"content-type": "application/json"},
+      body: JSON.stringify({model: "baton", stream: true, messages: history})});
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error?.message || `HTTP ${res.status}`);
+    const reader = res.body.getReader(), dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, {stream: true});
+      const parts = buf.split("\n\n"); buf = parts.pop();
+      for (const part of parts) {
+        const data = part.replace(/^data: /, "");
+        if (!data || data === "[DONE]") continue;
+        const chunk = JSON.parse(data);
+        if (chunk.error) throw new Error(chunk.error.message);
+        reply += chunk.choices[0].delta?.content ?? "";
+        box.textContent = reply;
+        if (chunk.x_baton) box.textContent += `\n\n${chunk.x_baton.decode_tok_s.toFixed(1)} tok/s · first token ${Math.round(chunk.x_baton.ttft_ms)} ms`;
+      }
+    }
+    history.push({role: "assistant", content: reply});
+  } catch (err) {
+    history.pop();
+    box.textContent = "Error: " + err.message;
+  } finally { busy = false; $("send").disabled = false; $("text").focus(); }
+};
+
+refresh();
+setInterval(refresh, 1500);
+</script>
+</body>
+</html>
