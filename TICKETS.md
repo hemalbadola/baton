@@ -52,6 +52,7 @@ This file is the ticket system for the project. Every change starts as a ticket 
 | BAT-39 | Story | OpenAI API, streaming, and the live dashboard | DONE |
 | BAT-40 | Bug | Qwen2 attention biases are dropped, the text is garbage | DONE |
 | BAT-41 | Story | `baton app`: one page per laptop, find nearby laptops, host or join | DONE |
+| BAT-42 | Task | Publish `baton-cluster` on GitHub, PyPI and Homebrew | DOING |
 | BAT-10 | Story | Run int8 and int4 weights in the decoder | BACKLOG |
 | BAT-11 | Story | Use the shard cache on load, memmap the embedding table | BACKLOG |
 | BAT-12 | Story | Measure round-trip time between workers (`ping_peer`) | BACKLOG |
@@ -414,6 +415,16 @@ This file is the ticket system for the project. Every change starts as a ticket 
   190 ms to first token. Not run on two physical laptops, or on Windows.
 - **Files:** `baton/agent.py`, `baton/agent_ui.html`, `baton/cli.py`, `pyproject.toml`,
   `install.sh`, `web/index.html`, `tests/integration/test_agent.py`
+
+### BAT-42 — Publish `baton-cluster` on GitHub, PyPI and Homebrew
+- **Done:** package renamed `baton-cluster` 0.1.0 (the name `baton` is taken on PyPI, the
+  command stays `baton`). Pushed to `main`, tag `v0.1.0`. The one-line install from GitHub
+  was run into an isolated tool directory: it installs in 3.5 minutes and `baton app` exists.
+  Tap `hemalbadola/homebrew-baton` is public, `brew style` passes.
+- **Open:** PyPI upload needs the owner's token: `uv publish /tmp/dist/*` after `uv build`.
+  The formula was not installed on the development Mac: its Command Line Tools are out of date.
+  Run `brew install hemalbadola/baton/baton` on a Mac with current tools. No license file exists.
+- **Files:** `pyproject.toml`, `README.md`, `install.sh`, `install.ps1`
 
 ### BAT-10 — Run int8 and int4 weights in the decoder (BACKLOG)
 - `quant.py` can quantize, but `layers.py` runs dense weights only. Until this is done,
