@@ -20,6 +20,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from baton import __version__
 from baton.head.driver import Rejected, Sampling
 
 if TYPE_CHECKING:
@@ -147,6 +148,15 @@ class NodeSnapshot(BaseModel):
     queue_depth: int
     state: Literal["joining", "loading", "loaded", "standby", "lost"]
     compute_ms: list[float] = []  # Extension: the last decode steps on this node.
+    # Extension: what this laptop does right now, in a sentence, and the numbers behind it.
+    activity: str = ""
+    embeds: bool = False  # holds layer 0 and the embedding table: turns words into numbers
+    picks: bool = False  # holds the last layer: picks the next word
+    load_done: int = 0
+    load_total: int = 0
+    active_reqs: int = 0
+    ms_per_layer: float = 0.0  # measured by the benchmark
+    device: str = ""  # "mps", "cuda" or "cpu", with the dtype
 
 
 class LiveStats(BaseModel):
@@ -183,6 +193,17 @@ class PlanInfo(BaseModel):
     rows: list[PlanRow]
 
 
+class Download(BaseModel):
+    """The head fetching the model files from Hugging Face, once."""
+
+    file: str
+    done: float
+    total: float
+    rate_mb_s: float
+    files_done: int
+    files_total: int
+
+
 class ClusterSnapshot(BaseModel):
     """The one object the dashboard renders. The dashboard does no math."""
 
@@ -194,6 +215,9 @@ class ClusterSnapshot(BaseModel):
     live: LiveStats
     events: list[ClusterEvent]  # Newest last, capped at 200 (14.2).
     plan: PlanInfo | None = None
+    phase: str = ""  # Extension: one line, what the cluster waits for or does now.
+    download: Download | None = None
+    version: str = ""
 
 
 class HealthResponse(BaseModel):
@@ -491,6 +515,27 @@ class ClusterApi:
             # Measured when the node has run decode steps, else the planner's figure.
             p50 = times[len(times) // 2] if times else predicted
             p95 = times[min(len(times) - 1, int(len(times) * 0.95))] if times else predicted
+            assigned = w.name in stage and w.first_layer is not None
+            span = f"layers {w.first_layer}-{w.last_layer}"
+            done, total, _ = h.load_progress.get(w.name, (0, 0, 0))
+            active = health.active_reqs if health else 0
+            if w.state == "lost":
+                activity = "lost"
+            elif w.state == "loading":
+                activity = (
+                    f"loading {span}: {done} of {total} tensors" if total else f"preparing {span}"
+                )
+            elif w.state == "loaded":
+                if active or (health and health.queue_depth):
+                    activity = f"computing {span} for {max(active, 1)} request(s)"
+                else:
+                    activity = f"holds {span}, waiting for a question"
+            elif caps.t_dec_ms <= 0:
+                activity = "waiting to be measured"
+            elif plan is not None and w.name not in stage:
+                activity = "measured, not needed by this plan"
+            else:
+                activity = f"measured: {caps.t_dec_ms:.1f} ms per layer"
             nodes.append(
                 NodeSnapshot(
                     name=w.name,
@@ -508,6 +553,14 @@ class ClusterApi:
                     queue_depth=health.queue_depth if health else 0,
                     state=w.state,
                     compute_ms=health.compute_ms if health else [],
+                    activity=activity,
+                    embeds=assigned and w.first_layer == 0,
+                    picks=assigned and w.holds_lm_head,
+                    load_done=done,
+                    load_total=total,
+                    active_reqs=active,
+                    ms_per_layer=caps.t_dec_ms,
+                    device=f"{caps.backend} {caps.compute_dtype}",
                 )
             )
         live = LiveStats(
@@ -516,6 +569,17 @@ class ClusterApi:
             active=len(driver.active) if driver else 0,
             queued=driver.queued if driver else 0,
         )
+        download = None
+        store = h.weights
+        if store is not None and store.total and not (store.ready and store.done == store.total):
+            download = Download(
+                file=store.file,
+                done=store.done,
+                total=store.total,
+                rate_mb_s=store.rate,
+                files_done=store.files_done,
+                files_total=len(store.files),
+            )
         plan_info = None
         if plan is not None and h.metadata is not None:
             plan_info = PlanInfo(
@@ -546,6 +610,9 @@ class ClusterApi:
             live=live,
             events=[ClusterEvent(**e) for e in h.events],
             plan=plan_info,
+            phase=h.phase,
+            download=download,
+            version=__version__,
         )
 
     async def subscribe(self):

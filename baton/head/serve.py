@@ -234,6 +234,12 @@ class Head:
     _last_join: float = field(default=0.0, repr=False)
     _errors: dict[str, str] = field(default_factory=dict, repr=False)
     _progress: dict[str, int] = field(default_factory=dict, repr=False)
+    phase: str = "starting"
+    """One line for the page: what the cluster waits for or does now."""
+
+    load_progress: dict[str, tuple[int, int, int]] = field(default_factory=dict, repr=False)
+    """Per worker: tensors done, tensors total, bytes fetched. Every frame, not every tenth."""
+
     weights: Any = field(default=None, repr=False)
     """`WeightStore`: the model's files on this disk. None without the HTTP server."""
 
@@ -391,6 +397,7 @@ class Head:
         head cannot count them before they join: `min_workers` is how the user
         says "wait for both laptops".
         """
+        self.phase = "waiting for the laptops to join"
         deadline = time.monotonic() + self.options.wait_s
         quiet = min(JOIN_QUIET_S, self.options.wait_s)
 
@@ -408,6 +415,7 @@ class Head:
 
     async def form_cluster(self) -> bool:
         """Steps 6 to 8: bench, plan, load. True when the cluster is READY."""
+        self.phase = "measuring each laptop"
         try:
             self.plan = self.make_plan(await self.benchmark())
         except PlannerError as exc:
@@ -416,6 +424,7 @@ class Head:
         if not self.plan.feasible:
             return False
         self.state = "loading"
+        self.phase = "downloading the model on this laptop"
         if self._download is not None:
             try:
                 await self._download
@@ -425,11 +434,14 @@ class Head:
                 self._download = asyncio.create_task(self.weights.ensure(self.echo))  # next try
                 self.state = "idle"
                 return False
+        self.phase = "loading the layers onto each laptop"
         if not await self.load_plan(self.plan):
             self.state = "idle"
+            self.phase = "a load failed, waiting for a laptop to join"
             return False
         self.driver = self.make_driver(self.plan)
         self.state = "ready"
+        self.phase = "ready"
         self.event("replan" if self.plan_rev > 1 else "join", f"plan {self.plan_rev} is loaded")
         self.echo(f"READY: plan {self.plan_rev} is loaded on {len(self.plan.assignments)} node(s)")
         self.echo(self.registry.roster_table())
@@ -558,6 +570,7 @@ class Head:
         self.plan_rev += 1
         self._errors.clear()
         self._progress.clear()
+        self.load_progress.clear()
         ring = plan_.assignments
         names = [a.name for a in ring]
         for worker in self.registry:  # a node the new plan leaves out must not keep its shard
@@ -707,6 +720,7 @@ class Head:
             self.driver = None
         if in_ring and self.state == "ready":
             self.state = "idle"
+            self.phase = f"{name} left. Waiting for a laptop to take its place"
         self._changed.set()
 
     async def _sweep(self) -> None:
@@ -818,6 +832,11 @@ class Head:
                         str(frame["req"]), str(frame.get("code")), str(frame.get("message"))
                     )
             elif kind == "load_progress":
+                self.load_progress[name] = (
+                    int(frame["done"]),
+                    int(frame["total"]),
+                    int(frame["bytes"]),
+                )
                 tenth = 10 * int(frame["done"]) // max(1, int(frame["total"]))
                 if tenth != self._progress.get(name):
                     self._progress[name] = tenth
@@ -827,6 +846,8 @@ class Head:
                     )
             elif kind == "loaded":
                 if int(frame["rev"]) == self.plan_rev:
+                    _, total, _ = self.load_progress.get(name, (0, 0, 0))
+                    self.load_progress[name] = (total, total, int(frame["resident_bytes"]))
                     self.registry.mark_loaded(name)
                     self.echo(
                         f"  {name}: loaded {int(frame['resident_bytes']) / 1024**2:.0f} MB "

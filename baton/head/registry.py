@@ -94,6 +94,7 @@ class Health:
     queue_depth: int
     loaded_rev: int | None = None
     compute_ms: list[float] = field(default_factory=list)
+    active_reqs: int = 0
 
     @classmethod
     def from_frame(cls, meta: dict[str, Any], at: float) -> Health:
@@ -109,6 +110,7 @@ class Health:
             free_bytes=_as_int(meta.get("mem_free")),
             kv_used_bytes=_as_int(meta.get("kv_used")),
             queue_depth=_as_int(meta.get("queue_depth")),
+            active_reqs=_as_int(meta.get("active_reqs")),
             loaded_rev=None if rev is None else _as_int(rev),
             compute_ms=[_as_float(v) for v in times][-12:] if isinstance(times, list) else [],
         )

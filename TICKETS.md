@@ -53,6 +53,8 @@ This file is the ticket system for the project. Every change starts as a ticket 
 | BAT-40 | Bug | Qwen2 attention biases are dropped, the text is garbage | DONE |
 | BAT-41 | Story | `baton app`: one page per laptop, find nearby laptops, host or join | DONE |
 | BAT-42 | Task | Publish `baton-cluster` on GitHub, PyPI and Homebrew | DOING |
+| BAT-43 | Story | The head serves the model files, workers keep them on disk | DONE |
+| BAT-44 | Story | Update Baton from the page, show what every laptop does | DONE |
 | BAT-10 | Story | Run int8 and int4 weights in the decoder | BACKLOG |
 | BAT-11 | Story | Use the shard cache on load, memmap the embedding table | BACKLOG |
 | BAT-12 | Story | Measure round-trip time between workers (`ping_peer`) | BACKLOG |
@@ -425,6 +427,25 @@ This file is the ticket system for the project. Every change starts as a ticket 
   The formula was not installed on the development Mac: its Command Line Tools are out of date.
   Run `brew install hemalbadola/baton/baton` on a Mac with current tools. No license file exists.
 - **Files:** `pyproject.toml`, `README.md`, `install.sh`, `install.ps1`
+
+### BAT-43 — The head serves the model files, workers keep them on disk (and BAT-11)
+- **Problem:** a guest laptop failed to download from Hugging Face (`WinError 10054`, five
+  retries), and one request per tensor made the first load take five minutes.
+- **Fix:** only the head downloads, once, in a resumable stream (988 MB at about 9 MB/s). Workers
+  fetch their layers from `GET /weights/<file>` on the head. Each worker keeps every tensor it
+  fetched under the cache root, so the second start reads the disk.
+- **Files:** `baton/head/weights.py`, `baton/head/api.py`, `baton/head/serve.py`,
+  `baton/model/cache.py`, `baton/worker/engine.py`, `baton/worker/daemon.py`
+
+### BAT-44 — Update Baton from the page, show what every laptop does
+- **Page:** a phase line and steps (join, measure, download, load, ready), a download bar, and one
+  card per laptop: device, layers on a strip, what it does now, load bar, memory, last step.
+- **Update:** `baton app` installs a newer version at start (`--no-update` skips), and the page
+  offers the same button. Only the `baton-cluster` package is replaced, so a CUDA torch stays.
+  The truth is `version` in `pyproject.toml` on `main`: raise it for every change users must get.
+- **Public page:** `https://baton-plum.vercel.app` asks `127.0.0.1:7800/api/hello` (one route, one
+  origin) and shows "Baton is running here" and "a new version is out".
+- **Files:** `baton/updater.py`, `baton/agent.py`, `baton/agent_ui.html`, `web/index.html`
 
 ### BAT-10 — Run int8 and int4 weights in the decoder (BACKLOG)
 - `quant.py` can quantize, but `layers.py` runs dense weights only. Until this is done,

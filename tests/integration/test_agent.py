@@ -220,3 +220,19 @@ async def test_another_laptop_cannot_click_for_the_user() -> None:
             assert r.status_code == 403, path
         assert a.state == "idle" and not ran
         assert (await http.get(f"{remote}/api/me")).status_code == 200  # peers may look
+
+
+async def test_the_public_page_may_ask_only_whether_baton_runs_here() -> None:
+    web = "https://baton-plum.vercel.app"
+    async with laptop("alpha") as (_a, _, url), httpx.AsyncClient(timeout=10) as http:
+        ok = await http.get(f"{url}/api/hello", headers={"origin": web})
+        assert ok.json()["baton"] is True and ok.json()["version"]
+        assert ok.headers["access-control-allow-origin"] == web
+        assert ok.headers["access-control-allow-private-network"] == "true"
+
+        other = await http.get(f"{url}/api/hello", headers={"origin": "https://evil.example"})
+        assert "access-control-allow-origin" not in other.headers
+
+        # Nothing else is open to a web page: no log, no actions.
+        me = await http.get(f"{url}/api/me", headers={"origin": web})
+        assert "access-control-allow-origin" not in me.headers

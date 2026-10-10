@@ -43,6 +43,29 @@ th { color:var(--muted); font-weight:500; font-size:12px; }
 form.compose { display:flex; gap:8px; }
 details pre { margin:8px 0 0; padding:10px; background:#0f1115; border-radius:8px; overflow:auto;
               font-size:12px; max-height:240px; color:var(--muted); }
+.steps { display:flex; gap:6px; flex-wrap:wrap; margin:6px 0 14px; }
+.step { padding:3px 10px; border-radius:99px; font-size:12px; border:1px solid var(--line); color:var(--muted); }
+.step.done { color:var(--ok); border-color:var(--ok); }
+.step.now { color:#0b0d12; background:var(--accent); border-color:var(--accent); font-weight:600; }
+.bar { height:8px; border-radius:99px; background:#0f1115; border:1px solid var(--line); overflow:hidden; }
+.bar > i { display:block; height:100%; background:var(--accent); transition:width .4s; }
+.bar.ok > i { background:var(--ok); }
+.cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:12px; margin-top:12px; }
+.card { border:1px solid var(--line); border-radius:10px; padding:12px 14px; background:#14171d; }
+.card h3 { margin:0 0 2px; font-size:15px; display:flex; gap:8px; align-items:center; }
+.chip { font-size:11px; padding:1px 7px; border-radius:99px; border:1px solid var(--line); color:var(--muted); }
+.chip.hot { color:var(--accent); border-color:var(--accent); }
+.strip { position:relative; height:10px; background:#0f1115; border:1px solid var(--line); border-radius:4px; margin:8px 0 4px; }
+.strip > i { position:absolute; top:0; bottom:0; background:var(--accent); opacity:.85; border-radius:3px; }
+.act { margin:8px 0 6px; }
+.kv { display:flex; justify-content:space-between; font-size:12px; color:var(--muted); }
+.flow { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin:14px 0 4px; font-size:13px; }
+.flow b { padding:3px 9px; border:1px solid var(--line); border-radius:8px; background:#14171d; }
+.flow .arrow { color:var(--muted); }
+.banner { border-color:var(--warn); }
+.warn { color:var(--warn); }
+.events { font-size:12px; color:var(--muted); margin:12px 0 0; padding:0; list-style:none; }
+.events li { padding:2px 0; }
 [hidden] { display:none !important; }
 </style>
 </head>
@@ -56,6 +79,13 @@ details pre { margin:8px 0 0; padding:10px; background:#0f1115; border-radius:8p
 
 <main>
   <div id="error" class="muted" style="color:var(--bad)" hidden></div>
+
+  <section id="update" class="banner" hidden>
+    <div class="row" style="border:0;padding:0">
+      <div class="grow"><b id="update-title"></b><div class="muted" id="update-how"></div></div>
+      <button class="primary" id="update-go" hidden>Update and restart</button>
+    </div>
+  </section>
 
   <section id="invites" hidden><h2>Invitations</h2><div id="invite-list"></div></section>
 
@@ -93,11 +123,16 @@ details pre { margin:8px 0 0; padding:10px; background:#0f1115; border-radius:8p
 
   <section id="cluster" hidden>
     <h2 id="cluster-title">Cluster</h2>
-    <div class="muted" id="cluster-line"></div>
-    <table id="nodes" hidden>
-      <thead><tr><th>laptop</th><th>role</th><th>layers</th><th class="num">compute</th><th>state</th></tr></thead>
-      <tbody></tbody>
-    </table>
+    <div id="phase" style="font-size:16px"></div>
+    <div class="steps" id="steps"></div>
+    <div id="download" hidden>
+      <div class="kv"><span id="download-text"></span><span id="download-rate"></span></div>
+      <div class="bar"><i id="download-bar" style="width:0"></i></div>
+      <div class="muted" style="margin-top:4px">Only the host downloads. The other laptops fetch from the host over the network.</div>
+    </div>
+    <div class="flow" id="flow"></div>
+    <div class="cards" id="cards"></div>
+    <ul class="events" id="events"></ul>
     <div style="margin-top:14px"><button class="danger" id="stop">Stop</button></div>
   </section>
 
@@ -129,6 +164,92 @@ async function call(path, body) {
 function fail(err) { const e = $("error"); e.textContent = String(err.message || err); e.hidden = false;
   setTimeout(() => e.hidden = true, 6000); }
 const act = (path, body) => call(path, body).then(refresh).catch(fail);
+
+const STEPS = [
+  ["waiting for the laptops", "Laptops join"],
+  ["measuring", "Measure speed"],
+  ["downloading", "Download model"],
+  ["loading the layers", "Load layers"],
+  ["ready", "Ready"],
+];
+const gb = n => (n / 1e9).toFixed(1) + " GB";
+const mb = n => Math.round(n / 1e6) + " MB";
+const pct = (a, b) => b ? Math.min(100, Math.round(100 * a / b)) : 0;
+
+function renderCluster() {
+  const c = cluster;
+  $("cluster-title").textContent = me.state === "hosting" ? "Your cluster" : `Joined ${me.joined ? me.joined.host : ""}`;
+  if (!c) {
+    $("phase").textContent = me.state === "hosting" ? "Starting the head on this laptop." : "Waiting for the host.";
+    $("steps").innerHTML = ""; show("download", false); $("cards").innerHTML = ""; $("flow").innerHTML = "";
+    return;
+  }
+  const phase = c.phase || c.state;
+  const at = STEPS.findIndex(([key]) => phase.startsWith(key));
+  $("phase").innerHTML = `${esc(phase.charAt(0).toUpperCase() + phase.slice(1))}${c.live && c.state === "SERVING" ? " · answering" : ""}`;
+  $("steps").innerHTML = STEPS.map(([, label], i) =>
+    `<span class="step ${at < 0 ? "" : i < at ? "done" : i === at ? "now" : ""}">${label}</span>`).join("");
+
+  const d = c.download;
+  show("download", !!d);
+  if (d) {
+    $("download-text").textContent = `${d.file}: ${mb(d.done)} of ${mb(d.total)}`;
+    $("download-rate").textContent = `${d.rate_mb_s.toFixed(1)} MB/s`;
+    $("download-bar").style.width = pct(d.done, d.total) + "%";
+  }
+
+  const ring = c.nodes.filter(n => n.role !== "-");
+  $("flow").innerHTML = ring.length < 1 ? "" :
+    `<span class="muted">a question travels:</span> ` +
+    ring.map(n => `<b>${esc(n.name)}</b>`).join('<span class="arrow">→</span>') +
+    `<span class="arrow">→ picks the next word → back to</span><b>${esc(ring[0].name)}</b>`;
+
+  const layers = c.model ? c.model.n_layers : 0;
+  $("cards").innerHTML = c.nodes.map(n => {
+    const onRing = n.role !== "-";
+    const loading = n.state === "loading";
+    const barDone = n.state === "loaded" ? 100 : pct(n.load_done, n.load_total);
+    const strip = onRing && layers ? `<div class="strip"><i style="left:${100 * n.layers[0] / layers}%;width:${100 * (n.layers[1] - n.layers[0] + 1) / layers}%"></i></div>
+        <div class="kv"><span>layers ${n.layers[0]}–${n.layers[1]} of ${layers}</span><span>${n.layers[1] - n.layers[0] + 1} layers</span></div>` : "";
+    const times = n.compute_ms || [];
+    const last = times.length ? times[times.length - 1] : null;
+    return `<div class="card">
+      <h3><span class="dot ${n.state === "loaded" ? "hosting" : n.state === "lost" ? "" : "idle"}"></span>${esc(n.name)}
+        ${n.name === me.name ? '<span class="chip">this laptop</span>' : ""}
+        ${onRing ? `<span class="chip hot">${esc(n.role)}</span>` : ""}</h3>
+      <div class="muted">${esc(n.device)}${n.ms_per_layer ? ` · ${n.ms_per_layer.toFixed(1)} ms per layer` : ""}</div>
+      ${strip}
+      <div class="act">${esc(n.activity)}</div>
+      ${loading || (onRing && n.state === "loaded" && barDone < 100) ? `<div class="bar"><i style="width:${barDone}%"></i></div>` : ""}
+      ${n.state === "loaded" ? `<div class="bar ok"><i style="width:100%"></i></div>` : ""}
+      ${onRing ? `<div class="kv" style="margin-top:8px"><span>${n.embeds ? "turns words into numbers" : ""}${n.embeds && n.picks ? " · " : ""}${n.picks ? "picks the next word" : ""}${!n.embeds && !n.picks ? "middle of the ring" : ""}</span></div>
+      <div class="kv"><span>memory</span><span>${gb(n.mem.weights)} weights · ${mb(n.mem.kv_used)} of ${mb(n.mem.kv_budget)} chat memory</span></div>
+      <div class="kv"><span>last step</span><span>${last === null ? "no question yet" : last.toFixed(1) + " ms"}${n.active_reqs ? ` · ${n.active_reqs} active` : ""}</span></div>` : ""}
+    </div>`;
+  }).join("");
+
+  $("events").innerHTML = (c.events || []).slice(-6).reverse().map(e =>
+    `<li>${new Date(e.t * 1000).toLocaleTimeString()} · ${esc(e.msg)}</li>`).join("");
+}
+
+async function checkUpdate() {
+  try {
+    const u = await call("/api/update");
+    show("update", u.newer);
+    if (!u.newer) return;
+    $("update-title").textContent = `Baton ${u.latest} is available. This laptop runs ${u.current}.`;
+    $("update-how").textContent = u.can_apply ? "The update replaces Baton on this laptop and starts it again. About a minute." : u.how;
+    $("update-go").hidden = !u.can_apply;
+  } catch (e) { /* offline: no banner */ }
+}
+$("update-go").onclick = () => {
+  if (me && me.state !== "idle" && me.state !== "lobby") return fail("Stop the cluster first.");
+  $("update-go").disabled = true;
+  call("/api/update/apply", {}).then(() => {
+    $("update-title").textContent = "Updating. This page reloads when Baton is back.";
+    const wait = setInterval(() => fetch("/api/me").then(() => { clearInterval(wait); location.reload(); }).catch(() => {}), 3000);
+  }).catch(e => { fail(e); $("update-go").disabled = false; });
+};
 
 async function refresh() {
   try { me = await call("/api/me"); peers = await call("/api/peers"); } catch (e) { return; }
@@ -170,26 +291,15 @@ function render() {
     const can = me.state === "lobby" && p.state === "idle";
     const note = accepted ? "accepted" : waiting ? "invited, waiting" : p.state === "idle" ? "ready" : p.state;
     return `<div class="row"><span class="dot ${p.state}"></span>
-      <div class="grow"><b>${esc(p.name)}</b> <span class="muted">${esc(note)}</span></div>
+      <div class="grow"><b>${esc(p.name)}</b> <span class="muted">${esc(note)} · v${esc(p.version || "?")}</span>
+        ${p.version && p.version !== me.version ? `<span class="warn" title="Different versions can fail in odd ways. Update this laptop.">&nbsp;different version</span>` : ""}</div>
       ${can && !accepted ? `<button data-invite="${esc(p.name)}">${waiting ? "Invite again" : "Invite"}</button>` : ""}
       </div>`;
   }).join("");
 
   const running = me.state === "hosting" || me.state === "joined";
   show("cluster", running);
-  if (running) {
-    $("cluster-title").textContent = me.state === "hosting" ? "Your cluster" : `Joined ${me.joined ? me.joined.host : ""}`;
-    const c = cluster;
-    // Before the cluster is ready, the last line of the log says what it waits for.
-    const waiting = (me.log[me.log.length - 1] || "").trim();
-    $("cluster-line").textContent = !c ? "Starting. The first start downloads the model once."
-      : c.state !== "READY" && c.state !== "SERVING" ? `${c.state} · ${waiting}`
-      : `${c.state} · ${c.model ? c.model.id : ""} · ${c.live.tok_s.toFixed(1)} tok/s · first token ${Math.round(c.live.ttft_ms)} ms`;
-    show("nodes", !!c && c.nodes.length > 0);
-    if (c) $("nodes").querySelector("tbody").innerHTML = c.nodes.map(n => `<tr>
-      <td>${esc(n.name)}</td><td>${esc(n.role)}</td><td>${n.layers[0]}–${n.layers[1]}</td>
-      <td class="num">${n.stage_ms.p50.toFixed(1)} ms</td><td>${esc(n.state)}</td></tr>`).join("");
-  }
+  if (running) renderCluster();
   const ready = !!cluster && (cluster.state === "READY" || cluster.state === "SERVING");
   show("chat", running && ready);
   $("log").textContent = me.log.join("\n");
@@ -248,7 +358,9 @@ $("compose").onsubmit = async e => {
 
 setInterval(refreshChat, 400);
 refresh();
-setInterval(refresh, 1500);
+setInterval(refresh, 1000);
+checkUpdate();
+setInterval(checkUpdate, 600000);
 </script>
 </body>
 </html>

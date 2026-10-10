@@ -30,12 +30,14 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
+from baton import __version__, updater
 from baton.common.net import CONTROL_PORT, lan_addresses
 
 AGENT_PORT = 7800
 HEAD_HTTP_PORT = 7700
 NODE_SERVICE = "_baton-node._tcp.local."
 PEER_TIMEOUT_S = 0.8
+WEB_ORIGINS = {"https://baton-plum.vercel.app"}
 
 #: Models the page offers. Sizes are bf16 on disk. Only `--quant none` loads (BAT-10).
 MODELS = [
@@ -203,7 +205,12 @@ class Agent:
                         me = r.json()
                     except (httpx.HTTPError, ValueError):
                         continue
-                    return {"name": me["name"], "addr": addr, "state": me["state"]}
+                    return {
+                        "name": me["name"],
+                        "addr": addr,
+                        "state": me["state"],
+                        "version": me.get("version", "?"),
+                    }
                 return None
 
             found = await asyncio.gather(*(ask(p) for p in list(self.peers.values())))
@@ -228,6 +235,7 @@ class Agent:
         room = self.room
         return {
             "name": self.name,
+            "version": __version__,
             "state": self.state,
             "backend": backend,
             "usable_gb": round(free / 1024**3, 1),
@@ -302,6 +310,49 @@ class Agent:
         @api.get("/api/me")
         async def me() -> dict[str, Any]:
             return self.me()
+
+        @api.get("/api/update")
+        async def update_info() -> dict[str, Any]:
+            latest = await asyncio.to_thread(updater.latest_version)
+            return {
+                "current": __version__,
+                "latest": latest,
+                "newer": updater.is_newer(latest),
+                "can_apply": updater.can_apply(),
+                "how": updater.how_to_update(),
+            }
+
+        @api.post("/api/update/apply")
+        async def update_apply(request: Request) -> Any:
+            """Replace this install and start again. A click from this laptop's page only."""
+            if not by_user(request):
+                return denied()
+            if self.state not in ("idle", "lobby"):
+                return bad("stop the cluster first: the update restarts this laptop's Baton")
+            try:
+                updater.apply()
+            except Exception as exc:  # noqa: BLE001 - shown on the page
+                return bad(str(exc), 500)
+            asyncio.get_running_loop().call_later(0.5, updater.exit_now)
+            return {"ok": True}
+
+        @api.api_route("/api/hello", methods=["GET", "OPTIONS"])
+        async def hello(request: Request) -> Any:
+            """What the public page may ask: is Baton running here, and which version.
+            It is the one route with CORS, for one origin, and it shows no log."""
+            origin = request.headers.get("origin", "")
+            headers = {}
+            if origin in WEB_ORIGINS:
+                headers = {
+                    "access-control-allow-origin": origin,
+                    "access-control-allow-private-network": "true",
+                    "access-control-allow-methods": "GET",
+                    "vary": "origin",
+                }
+            if request.method == "OPTIONS":
+                return JSONResponse({}, headers=headers)
+            body = {"baton": True, "name": self.name, "version": __version__, "state": self.state}
+            return JSONResponse(body, headers=headers)
 
         @api.get("/api/peers")
         async def peers() -> list[dict[str, Any]]:

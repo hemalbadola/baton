@@ -121,12 +121,21 @@ def open_app(
     browser: Annotated[
         bool, typer.Option("--browser/--no-browser", help="Open the page in the browser.")
     ] = True,
+    update: Annotated[
+        bool, typer.Option("--update/--no-update", help="Install a newer Baton before it starts.")
+    ] = True,
 ) -> None:
     """Open the page: find nearby laptops, host a model or join one, chat. No other command."""
     import asyncio
     import contextlib
 
     _require_torch()
+    if update:
+        from baton import updater
+
+        if updater.update_at_start():
+            typer.echo("baton: a newer version exists. Updating, then Baton starts again.")
+            raise typer.Exit(0)
     from baton.agent import run_agent
 
     with contextlib.suppress(KeyboardInterrupt, asyncio.CancelledError):

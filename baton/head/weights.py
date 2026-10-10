@@ -41,6 +41,15 @@ class WeightStore:
         self.local = Path(model) if Path(model).is_dir() else None
         self.commit: str | None = None
         self.ready = self.local is not None
+        self.file = ""
+        """The file in flight, for the page."""
+
+        self.done = 0
+        self.total = 0
+        self.rate = 0.0
+        """Megabytes per second since the file started."""
+
+        self.files_done = 0
 
     @property
     def _pointer(self) -> Path:
@@ -67,6 +76,7 @@ class WeightStore:
         if self.local is None:
             for file in sorted(self.files):
                 await asyncio.to_thread(self._download, file, echo)
+                self.files_done += 1
         self.ready = True
 
     def _download(self, file: str, echo: Callable[[str], None]) -> None:
@@ -90,10 +100,12 @@ class WeightStore:
                 self.commit = hop.headers.get("x-repo-commit") or self.commit
             self.commit = self.commit or self.revision
             total = int(probe.headers["content-range"].rsplit("/", 1)[1])
+            self.file, self.total, self.done = file, total, 0
             dest = self.path(file)
             dest.parent.mkdir(parents=True, exist_ok=True)
             self._pointer.write_text(self.commit)
             if dest.exists() and dest.stat().st_size == total:
+                self.done = total
                 echo(f"{file}: on disk already ({total / 1e6:.0f} MB)")
                 return
 
@@ -117,6 +129,8 @@ class WeightStore:
                             for chunk in response.iter_bytes(1 << 20):
                                 fh.write(chunk)
                                 have += len(chunk)
+                                self.done = have
+                                self.rate = have / 1e6 / max(time.monotonic() - started, 1e-3)
                                 if 10 * have // total != tenth:
                                     tenth = 10 * have // total
                                     rate = have / 1e6 / max(time.monotonic() - started, 1e-3)
@@ -130,3 +144,4 @@ class WeightStore:
             if not part.exists() or part.stat().st_size != total:
                 raise RuntimeError(f"cannot download {file}: {last}")
             part.replace(dest)
+            self.done = total
