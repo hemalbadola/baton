@@ -6,8 +6,9 @@
                 [--kv-fraction 0.2]
 
 The steps of 7.1 are one method each, so the CLI and the tests can drive them
-one at a time. Steps 1 to 8 are real. The HTTP server of step 1 and the URLs
-of step 9 belong to the API lane (PRD 13) and are not built yet.
+one at a time. `token`, `release_ack` and request `error` frames come back on
+the control socket, which already exists and is already authenticated, so the
+head needs no second listener for the data plane.
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ from baton.common.net import (
     send_frame,
     set_nodelay,
 )
-from baton.head.driver import Driver
+from baton.head.driver import Admission, Driver
 from baton.head.planner import Device, Fleet, Model, Plan, PlannerError, Workload, format_plan, plan
 from baton.head.registry import Capabilities, Health, NameInUse, Registry, Worker
 from baton.model import safetensors_io as sio
@@ -81,6 +82,9 @@ class ServeOptions:
     plan_override: str | None = None
     min_workers: int = 1
     wait_s: float = JOIN_DEADLINE_S
+    dashboard: bool = True
+    http: bool = False
+    """Serve the OpenAI API and the dashboard on `port`. `baton serve` sets it."""
 
 
 @dataclass
@@ -98,6 +102,7 @@ class ModelMetadata:
     index: dict[str, str]
     shard_headers: dict[str, tuple[dict[str, Any], int]]
     tokenizer: Any = None
+    eos_ids: frozenset[int] = frozenset()
 
     @property
     def spec(self) -> ModelSpec:
@@ -171,6 +176,27 @@ def read_metadata(model: str, token: str | None = None, revision: str = "main") 
     return ModelMetadata(config=config, tokenizer_config={}, index=index, shard_headers=headers)
 
 
+def load_tokenizer(model: str, token: str | None = None, revision: str = "main") -> Any:
+    """The Hugging Face tokenizer of `model`: a checkpoint directory or a repo id."""
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(model, token=token or None, revision=revision)
+
+
+def eos_ids(config: dict[str, Any], tokenizer: Any) -> frozenset[int]:
+    """Every id that ends a reply: the config's eos list and the tokenizer's end-of-turn token."""
+    found: set[int] = set()
+    eos = config.get("eos_token_id")
+    found.update(eos if isinstance(eos, list) else [] if eos is None else [eos])
+    if tokenizer is not None:
+        if tokenizer.eos_token_id is not None:
+            found.add(int(tokenizer.eos_token_id))
+        eot = tokenizer.convert_tokens_to_ids("<|eot_id|>")
+        if isinstance(eot, int) and eot != tokenizer.unk_token_id:
+            found.add(eot)
+    return frozenset(int(i) for i in found)
+
+
 def lan_addresses() -> list[str]:
     """Every IPv4 address a LAN peer could dial, or loopback when there is none."""
     import psutil
@@ -222,6 +248,10 @@ class Head:
     _last_join: float = field(default=0.0, repr=False)
     _errors: dict[str, str] = field(default_factory=dict, repr=False)
     _progress: dict[str, int] = field(default_factory=dict, repr=False)
+    _http: Any = field(default=None, repr=False)
+    _tasks: set[asyncio.Task[None]] = field(default_factory=set, repr=False)
+    events: list[dict[str, Any]] = field(default_factory=list, repr=False)
+    """Newest last, capped at 200. The dashboard log reads this (PRD 14.2)."""
 
     # --- the sequence ---------------------------------------------------------
 
@@ -237,6 +267,7 @@ class Head:
             )
         try:
             await self.start_servers()
+            await self.start_http()
             await self.advertise()
             if not self.options.no_local_worker:
                 await self.spawn_local_worker()
@@ -270,6 +301,22 @@ class Head:
             f"workers on this network join by themselves. If one cannot: "
             f"baton worker --head {address}"
         )
+
+    async def start_http(self) -> None:
+        """Step 1, second half: the OpenAI API and the dashboard (PRD 13)."""
+        if not self.options.http:
+            return
+        import uvicorn
+
+        from baton.head.api import ClusterApi, create_app
+
+        dist = Path(__file__).resolve().parents[2] / "dashboard" / "dist"
+        mount = str(dist) if self.options.dashboard and dist.is_dir() else None
+        app = create_app(ClusterApi(self), mount)
+        config = uvicorn.Config(app, host="0.0.0.0", port=self.options.port, log_level="warning")
+        self._http = uvicorn.Server(config)
+        self._http.install_signal_handlers = lambda: None  # `serve` owns SIGTERM
+        self._tasks.add(asyncio.create_task(self._http.serve()))
 
     async def advertise(self) -> None:
         """Step 2. Announce `_baton._tcp.local.` over mDNS.
@@ -318,7 +365,15 @@ class Head:
         """Step 4. Fetch the model metadata (PRD 7.1, 12.1)."""
         o = self.options
         self.echo(f"reading model metadata: {o.model}")
-        return await asyncio.to_thread(read_metadata, o.model, o.hf_token, o.revision)
+        meta = await asyncio.to_thread(read_metadata, o.model, o.hf_token, o.revision)
+        try:
+            meta.tokenizer = await asyncio.to_thread(
+                load_tokenizer, o.model, o.hf_token, o.revision
+            )
+        except Exception as exc:  # noqa: BLE001 - the cluster can still form, the API cannot
+            self.echo(f"no tokenizer ({exc!r}): the HTTP API cannot take text")
+        meta.eos_ids = eos_ids(meta.config, meta.tokenizer)
+        return meta
 
     async def wait_for_workers(self) -> None:
         """Step 5. Wait for the fleet, then print the roster.
@@ -356,10 +411,37 @@ class Head:
         if not await self.load_plan(self.plan):
             self.state = "idle"
             return False
+        self.driver = self.make_driver(self.plan)
         self.state = "ready"
+        self.event("replan" if self.plan_rev > 1 else "join", f"plan {self.plan_rev} is loaded")
         self.echo(f"READY: plan {self.plan_rev} is loaded on {len(self.plan.assignments)} node(s)")
         self.echo(self.registry.roster_table())
+        self.print_urls()
         return True
+
+    def make_driver(self, plan_: Plan) -> Driver | None:
+        """The request driver for one loaded plan (PRD 7.3). None without a tokenizer."""
+        assert self.metadata is not None
+        if self.metadata.tokenizer is None:
+            return None
+        spec = self.metadata.spec
+        per_token: dict[str, int] = {}
+        budgets: dict[str, int] = {}
+        for a in plan_.assignments:
+            caps = self.registry.get(a.name).capabilities  # type: ignore[union-attr]
+            per_token[a.name] = (
+                2 * spec.n_kv_heads * spec.head_dim * DTYPE_BYTES[caps.compute_dtype]
+            )
+            budgets[a.name] = int(caps.usable_bytes * plan_.kv_fraction)
+        admission = Admission(plan_, budgets, per_token=per_token)
+        return Driver(
+            self.registry, admission, self.metadata.tokenizer, self.options.ctx,
+            eos_ids=self.metadata.eos_ids,
+        )  # fmt: skip
+
+    def event(self, kind: str, msg: str) -> None:
+        self.events.append({"t": time.time(), "kind": kind, "msg": msg})
+        del self.events[:-200]
 
     async def benchmark(self) -> Fleet:
         """Step 6. Send `bench` to every worker that has no timing yet, wait up to 60 s.
@@ -471,7 +553,12 @@ class Head:
             if worker is None or worker.state == "lost":
                 self._errors[a.name] = "lost before load"
                 break
-            following = self.registry.get(names[position + 1]) if position + 1 < len(ring) else None
+            # Nk dials N1, so `next` and `release` ride the same ring (PRD 10.2).
+            # One node needs no link: the ring is that process.
+            if position + 1 < len(ring):
+                following = self.registry.get(names[position + 1])
+            else:
+                following = self.registry.get(names[0]) if len(ring) > 1 else None
             self.registry.assign(a.name, a.first_layer, a.last_layer, a.holds_lm_head)
             frame: dict[str, Any] = {
                 "t": "load",
@@ -513,7 +600,10 @@ class Head:
 
     def print_urls(self) -> None:
         """Step 9. Print the API URL and the dashboard URL."""
-        raise NotImplementedError
+        if not self.options.http:
+            return
+        base = f"http://{lan_addresses()[0]}:{self.options.port}"
+        self.echo(f"dashboard: {base}/\napi:       {base}/v1  (OpenAI compatible)")
 
     async def replan(self, lost: str) -> Plan:
         """Re-plan after a worker loss (PRD 7.6, 11).
@@ -528,6 +618,9 @@ class Head:
         """Stop advertising, close every socket, stop the local worker."""
         if self._sweeper is not None:
             self._sweeper.cancel()
+        if self._http is not None:
+            self._http.should_exit = True
+            await asyncio.gather(*self._tasks, return_exceptions=True)
         if self._mdns is not None:
             with contextlib.suppress(Exception):
                 await self._mdns.async_unregister_all_services()
@@ -585,6 +678,10 @@ class Head:
         in_ring = worker.state in ("loading", "loaded")
         self.registry.mark_lost(name)
         self.echo(f"lost {name}: {why}")
+        self.event("loss", f"{name}: {why}")
+        if in_ring and self.driver is not None:
+            self.driver.fail_all("worker_lost", f"{name} left the ring: {why}")
+            self.driver = None
         if in_ring and self.state == "ready":
             self.state = "idle"
         self._changed.set()
@@ -668,6 +765,7 @@ class Head:
         self._joins += 1
         self._last_join = time.monotonic()
         self.echo(f"joined: {name}")
+        self.event("join", f"{name} joined")
         self._changed.set()
         return name
 
@@ -679,6 +777,23 @@ class Head:
                 self.registry.on_health(name, Health.from_frame(frame, self.registry.clock()))
             elif kind == "bench_result":
                 self.registry.on_bench(name, frame["t_dec_ms"], frame["t_pre_ms"])
+            elif kind == "token" and self.driver is not None:
+                self.driver.on_token(
+                    str(frame["req"]),
+                    int(frame["id"]),
+                    int(frame["pos"]),
+                    bool(frame["final"]),
+                    str(frame.get("reason", "")),
+                )
+            elif kind == "release_ack" and self.driver is not None:
+                self.driver.on_release_ack(str(frame["req"]))
+            elif kind == "link_down" and self.driver is not None:
+                self.driver.fail_all("worker_lost", f"ring link to {frame.get('peer')} is down")
+            elif kind == "error" and "req" in frame:
+                if self.driver is not None:
+                    self.driver.on_error(
+                        str(frame["req"]), str(frame.get("code")), str(frame.get("message"))
+                    )
             elif kind == "load_progress":
                 tenth = 10 * int(frame["done"]) // max(1, int(frame["total"]))
                 if tenth != self._progress.get(name):
@@ -696,7 +811,11 @@ class Head:
                     )
             # A load error names its plan revision. One from an old plan must
             # not fail the plan that replaced it.
-            elif kind == "error" and int(frame.get("rev", self.plan_rev)) == self.plan_rev:
+            elif (
+                kind == "error"
+                and "req" not in frame
+                and int(frame.get("rev", self.plan_rev)) == self.plan_rev
+            ):
                 self._errors[name] = f"{frame.get('code')}: {frame.get('message')}"
                 self.echo(f"error from {name}: {self._errors[name]}")
         except (KeyError, TypeError, ValueError, OverflowError) as exc:

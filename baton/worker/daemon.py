@@ -1,14 +1,15 @@
 """Worker daemon: startup, control loop, reconnect (PRD 6.1, 11).
 
 The daemon is the only part of the worker that talks to the head. It runs an
-asyncio loop on the main thread and never touches the model: every unit of real
-work goes to `engine.ForwardEngine`, which owns its own compute thread. That
-split is what keeps the 2 s heartbeat alive while a prefill chunk runs.
+asyncio loop on the main thread and never touches the model: every frame goes
+to `engine.ForwardEngine.handle` through `asyncio.to_thread`, one at a time.
+That split is what keeps the 2 s heartbeat alive while a prefill chunk runs.
 """
 
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import gc
 import logging
@@ -261,6 +262,14 @@ class WorkerDaemon:
         self._inbound: set[asyncio.StreamWriter] = set()
         self._tasks: set[asyncio.Task[None]] = set()
 
+        self._inbox: asyncio.Queue[tuple[dict[str, Any], bytes]] = asyncio.Queue()
+        """Data-plane frames for the engine, from the ring links and from the head."""
+
+        self._pump: asyncio.Task[None] | None = None
+        self._next_addr = ""
+        self._compute_ms: collections.deque[float] = collections.deque(maxlen=64)
+        """Milliseconds of the last decode frames on the compute thread, for the dashboard."""
+
     async def run(self) -> None:
         """Run the startup sequence, then serve until stopped.
 
@@ -341,17 +350,13 @@ class WorkerDaemon:
         return "0.0.0.0", self.data_port
 
     async def _on_data(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        """Accept one ring link (PRD 8.5) and hold it open.
-
-        ponytail: frames are read and dropped. The forward engine that consumes
-        them is the inference phase; a link that opens and authenticates is
-        what `loaded` promises today.
-        """
+        """Accept one ring link (PRD 8.5) and queue every frame for the engine."""
         try:
             await accept_data_link(reader, writer, self.cluster_id, self.config.token or "")
             self._inbound.add(writer)
-            while await reader.read(1 << 16):
-                pass
+            while True:
+                meta, payload = await read_frame(reader)
+                self._inbox.put_nowait((meta, payload))
         except (AuthError, LinkClosed, TimeoutError, OSError) as exc:
             log.debug("data link refused or closed: %s", exc)
         finally:
@@ -450,10 +455,11 @@ class WorkerDaemon:
                     {
                         "t": "health",
                         "mem_free": max(0, self.budget.usable_bytes - self.resident_bytes),
-                        "kv_used": 0,
-                        "queue_depth": 0,
-                        "active_reqs": 0,
+                        "kv_used": self.engine.kv.used_bytes if self.engine else 0,
+                        "queue_depth": self._inbox.qsize(),
+                        "active_reqs": self.engine.active_reqs if self.engine else 0,
                         "loaded_rev": self.loaded_rev,
+                        "compute_ms": list(self._compute_ms)[-12:],
                     }
                 )
                 await asyncio.sleep(HEALTH_INTERVAL_S)
@@ -476,6 +482,8 @@ class WorkerDaemon:
         elif kind == "load":
             self._epoch += 1
             self._spawn(self.handle_load(frame, self._epoch))
+        elif kind in ("prompt", "next", "abort", "release"):
+            self._inbox.put_nowait((frame, b""))
         elif kind == "unload":
             # A task, like `load`: tasks start in creation order and the device
             # lock is first-in first-out, so `load` then `unload` cannot swap.
@@ -534,7 +542,7 @@ class WorkerDaemon:
 
         from baton.model import safetensors_io as sio
         from baton.model.spec import ModelSpec
-        from baton.worker.engine import ShardTooLarge, load_shard
+        from baton.worker.engine import ForwardEngine, KVPool, ShardTooLarge, load_shard
 
         assert self.backend is not None and self.caps is not None and self.budget is not None
         progress = [0, 0, 0]
@@ -562,10 +570,12 @@ class WorkerDaemon:
                 if msg["quant"] != "bf16":
                     raise ValueError(f"quant {msg['quant']!r} is not loadable yet (BAT-10)")
                 first, last = (int(layer) for layer in msg["range"])
+                spec = ModelSpec(**msg["spec"])
+                dtype = torch_dtype(self.caps.compute_dtype)
                 source = sio.open_source(str(msg["model"]), msg.get("hf_token"))
                 stack, resident = await asyncio.to_thread(
                     load_shard,
-                    ModelSpec(**msg["spec"]),
+                    spec,
                     first,
                     last,
                     embed=bool(msg["roles"]["embed"]),
@@ -574,11 +584,12 @@ class WorkerDaemon:
                     index=msg["index"],
                     ctx_max=int(msg["ctx_max"]),
                     device=self.backend,
-                    dtype=torch_dtype(self.caps.compute_dtype),
+                    dtype=dtype,
                     budget_bytes=self.budget.usable_bytes,
                     on_progress=on_progress,
                 )
                 self.stack, self.resident_bytes = stack, resident
+                self._next_addr = str(msg["next_node"])
                 if msg["next_node"]:
                     _, self._next = await open_data_link(
                         str(msg["next_node"]),
@@ -586,6 +597,15 @@ class WorkerDaemon:
                         self.config.token or "",
                         total_timeout=DATA_CONNECT_S,
                     )
+                per_token = 2 * spec.n_kv_heads * spec.head_dim * dtype.itemsize
+                engine = ForwardEngine(
+                    stack,
+                    KVPool(int(msg["kv_budget_bytes"]), stack.n_local_layers, per_token),
+                    device=self.backend,
+                    dtype=dtype,
+                    wire=self.config.wire_dtype,
+                    ctx_max=int(msg["ctx_max"]),
+                )
                 rev = int(msg["plan_rev"])
                 if superseded():
                     raise RuntimeError("load superseded")
@@ -605,6 +625,8 @@ class WorkerDaemon:
                     source.close()
 
             self.loaded_rev = rev
+            self.engine = engine
+            self._pump = asyncio.create_task(self._pump_frames(engine))
             await self._send(
                 {
                     "t": "loaded",
@@ -622,6 +644,11 @@ class WorkerDaemon:
         peer closes its own end when it frees. Closing them here would cut a
         link that a faster neighbour opened for the plan now being loaded.
         """
+        if self._pump is not None:
+            self._pump.cancel()
+            self._pump = None
+        self.engine = None
+        self._inbox = asyncio.Queue()
         if self._next is not None:
             self._next.close()
             self._next = None
@@ -656,12 +683,46 @@ class WorkerDaemon:
         log.warning("control connection lost; reconnecting")
 
     async def on_peer_lost(self, peer: str) -> None:
-        """Report `link_down{peer}` when a ring data socket closes (PRD 11.1).
+        """Report `link_down{peer}` when a ring data socket fails (PRD 11.1).
 
         The worker does not re-plan and does not drop its shard. The head owns
         that decision (PRD 11.2).
         """
-        raise NotImplementedError
+        await self._send({"t": "link_down", "peer": peer})
+
+    async def _pump_frames(self, engine: ForwardEngine) -> None:
+        """Feed the engine one frame at a time and send what it returns (PRD 6.6).
+
+        A failed frame ends its own request, not the worker: the error carries
+        `req`, and the head aborts the ring for it.
+        """
+        from baton.worker.engine import OutOfMemoryOnKV
+
+        while True:
+            meta, payload = await self._inbox.get()
+            try:
+                started = time.perf_counter()
+                outs = await asyncio.to_thread(engine.handle, meta, payload)
+                if meta.get("n", 1) == 1 and meta["t"] in ("next", "act"):  # a decode step
+                    self._compute_ms.append((time.perf_counter() - started) * 1000)
+                for out in outs:
+                    if out.to == "head":
+                        await self._send(out.meta)
+                    elif self._next is None:  # one node: the ring is this process
+                        self._inbox.put_nowait((out.meta, out.payload))
+                    else:
+                        await send_frame(self._next, out.meta, out.payload)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - reported to the head, which owns the decision
+                req = meta.get("req")
+                if req:
+                    engine.drop(req)
+                if isinstance(exc, OSError):
+                    await self.on_peer_lost(self._next_addr)
+                code = "oom" if isinstance(exc, OutOfMemoryOnKV) else "forward_failed"
+                frame = {"t": "error", "code": code, "message": repr(exc)}
+                await self._send(frame | ({"req": req} if req else {}))
 
     async def stop(self) -> None:
         """Cancel work in flight, close sockets, free the shard."""

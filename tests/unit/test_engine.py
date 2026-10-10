@@ -1,93 +1,124 @@
-"""Forward engine and compute thread tests (PRD 6.6).
+"""Forward engine tests (PRD 6.6). Two engines on one process play a two-node
+ring: the test carries each `Out` where the ring would carry it."""
 
-Skeleton for M1. The engine tests use a fake `ShardRunner`, so none of them
-need a GPU or a real model.
-"""
+import torch
 
-import pytest
+from baton.model.layers import DecoderStack
+from baton.worker.engine import ForwardEngine, KVPool
 
-pytestmark = pytest.mark.skip(reason="M1 interface only; ForwardEngine not implemented")
-
-
-class TestThreadSeparation:
-    def test_control_loop_never_blocks_on_a_running_job(self) -> None:
-        """`submit` returns while the compute thread is mid-frame. This is the
-        property the 2 s heartbeat depends on."""
-
-    def test_exactly_one_compute_thread_runs(self) -> None:
-        """One thread means no lock protects the model itself."""
-
-    def test_start_is_idempotent(self) -> None:
-        """A second `start` must not create a second compute thread."""
-
-    def test_outbound_frames_cross_threads_through_the_loop(self) -> None:
-        """Frames reach asyncio through `call_soon_threadsafe`, never by a
-        direct `asyncio.Queue.put_nowait` from the compute thread."""
-
-    def test_an_exception_in_a_job_does_not_kill_the_thread(self) -> None:
-        """One bad request must not stop every other request on this worker."""
-
-    def test_stop_wakes_the_thread_from_a_blocking_get(self) -> None:
-        """The sentinel, not a poll timeout, ends the loop."""
+PROMPT = [1, 5, 9, 2, 7, 3]
 
 
-class TestJobOrder:
-    def test_jobs_run_in_arrival_order(self) -> None:
-        """One frame at a time, first in first out (PRD 6.6)."""
+def split(whole: DecoderStack, cut: int = 2) -> tuple[ForwardEngine, ForwardEngine]:
+    spec = whole.spec
+    state = whole.state_dict()
+    names = whole.checkpoint_keys()
 
-    def test_queue_depth_reports_waiting_jobs(self) -> None:
-        """The head reads this for admission control (PRD 7.5)."""
+    def engine(start: int, end: int, *, first: bool, last: bool) -> ForwardEngine:
+        stack = DecoderStack(
+            spec, start, end, embed=first, head=last, max_ctx=whole.max_ctx, dtype=torch.float32
+        )
+        # Only the tensors this shard owns are needed, by checkpoint name.
+        own = set(stack.checkpoint_keys().values())
+        stack.load_hf_weights({n: state[k] for k, n in names.items() if n in own})
+        per_token = 2 * spec.n_kv_heads * spec.head_dim * 4
+        kv = KVPool(10**9, end - start, per_token)
+        return ForwardEngine(
+            stack.eval(), kv, device="cpu", dtype=torch.float32, wire="fp32", ctx_max=64
+        )
 
-
-class TestPromptJob:
-    def test_prompt_splits_into_chunks_of_256(self) -> None:
-        """Chunk width is a constant by decision D10."""
-
-    def test_a_short_prompt_emits_one_act_frame(self) -> None:
-        """Fewer than 256 ids must not pad to a full chunk."""
-
-    def test_prompt_is_rejected_off_n1(self) -> None:
-        """Only the worker holding layer 0 embeds (PRD 4.3, D5)."""
-
-    def test_kv_is_allocated_on_the_first_frame_only(self) -> None:
-        """Later chunks of the same prompt reuse the entry."""
-
-
-class TestActJob:
-    def test_payload_is_viewed_in_compute_dtype(self) -> None:
-        """The wire dtype is bf16; a fp16 node casts on send, not on receive
-        interpretation (PRD 8.4)."""
-
-    def test_middle_node_emits_act_to_the_next_node(self) -> None:
-        """Ni forwards activations to Ni+1."""
-
-    def test_last_node_samples_and_emits_token_and_next(self) -> None:
-        """Nk sends `token` to the head and `next` to N1 (D6)."""
-
-    def test_last_node_runs_the_head_on_the_last_row_only(self) -> None:
-        """A 256-row prefill chunk needs one logits row, not 256."""
+    return engine(0, cut, first=True, last=False), engine(
+        cut, spec.n_layers, first=False, last=True
+    )
 
 
-class TestReleaseAndAbort:
-    def test_release_frees_kv_then_forwards_the_frame(self) -> None:
-        """Free first: the next node may be waiting on this memory."""
+def run_ring(n1: ForwardEngine, nk: ForwardEngine, first: dict, steps: int) -> list[int]:
+    """Carry frames until `steps` tokens came out. Returns the token ids."""
+    tokens: list[int] = []
+    queue = [("n1", first, b"")]
+    while queue and len(tokens) < steps:
+        who, meta, payload = queue.pop(0)
+        for out in (n1 if who == "n1" else nk).handle(meta, payload):
+            if out.to == "head":
+                if out.meta["t"] == "token":
+                    tokens.append(out.meta["id"])
+            elif who == "n1":  # N1's next node is Nk
+                queue.append(("nk", out.meta, out.payload))
+            else:  # Nk's next node is N1
+                queue.append(("n1", out.meta, out.payload))
+    return tokens
 
-    def test_release_stops_when_it_returns_to_its_originator(self) -> None:
-        """Nk recognises its own `release` and does not send it round twice
-        (PRD 6.6, 8.3)."""
 
-    def test_abort_stops_at_the_last_node(self) -> None:
-        """`abort` starts at the head, so its stop rule is 'I am Nk', not
-        'this frame is mine'. See the note to god on PRD 6.6 versus 8.3."""
+def prompt_frame(n: int) -> dict:
+    return {
+        "t": "prompt",
+        "req": "r",
+        "ids": PROMPT,
+        "max_len": len(PROMPT) + n,
+        "sampling": {"temperature": 0.0},
+        "stop_ids": [],
+        "trace": [],
+    }
 
 
-class TestTrace:
-    def test_receive_appends_a_node_entry(self) -> None:
-        """`{node, t_recv}` per hop (PRD 6.6)."""
+def test_two_engines_match_the_whole_model(tiny_checkpoint) -> None:
+    _, _, whole = tiny_checkpoint
+    n1, nk = split(whole)
+    got = run_ring(n1, nk, prompt_frame(6), 6)
 
-    def test_send_adds_t_send_to_the_same_entry(self) -> None:
-        """One entry per node, two timestamps."""
+    # Reference: the same stack, one cache, argmax.
+    ref = ForwardEngine(
+        whole, KVPool(10**9, whole.n_local_layers, 2 * whole.spec.n_kv_heads * whole.spec.head_dim * 4),
+        device="cpu", dtype=torch.float32, wire="fp32", ctx_max=64,
+    )  # fmt: skip
+    queue = [prompt_frame(6)]
+    want: list[int] = []
+    while queue and len(want) < 6:
+        for out in ref.handle(queue.pop(0)):
+            if out.meta["t"] == "token":
+                want.append(out.meta["id"])
+            elif out.to == "next":
+                queue.append(out.meta)
+    assert got == want and len(got) == 6
 
-    def test_timestamps_are_monotonic_within_a_node(self) -> None:
-        """`perf_counter_ns`, never a wall clock: clocks are not compared
-        across nodes (PRD 17.2)."""
+
+def test_a_frame_for_an_unknown_request_is_dropped(tiny_checkpoint) -> None:
+    _, _, whole = tiny_checkpoint
+    n1, nk = split(whole)
+    assert n1.handle({"t": "next", "req": "gone", "id": 3, "pos": 4}) == []
+    assert (
+        nk.handle({"t": "act", "req": "gone", "pos": 0, "n": 1, "dtype": "fp32", "last": True}, b"")
+        == []
+    )
+
+
+def test_release_frees_kv_and_only_the_last_node_acks(tiny_checkpoint) -> None:
+    _, _, whole = tiny_checkpoint
+    n1, nk = split(whole)
+    n1.handle(prompt_frame(2))
+    nk.handle(prompt_frame(2))
+    assert n1.active_reqs == nk.active_reqs == 1
+    forwarded = n1.handle({"t": "release", "req": "r"})
+    assert [o.to for o in forwarded] == ["next"] and n1.active_reqs == 0
+    acked = nk.handle({"t": "release", "req": "r"})
+    assert [(o.to, o.meta["t"]) for o in acked] == [("head", "release_ack")]
+    assert nk.active_reqs == 0
+    assert n1.kv.used_bytes == nk.kv.used_bytes == 0
+
+
+def test_a_stop_id_ends_the_request_on_the_token_frame(tiny_checkpoint) -> None:
+    _, _, whole = tiny_checkpoint
+    n1, nk = split(whole)
+    first = run_ring(n1, nk, prompt_frame(1), 1)[0]
+    n1, nk = split(whole)
+    frame = prompt_frame(5) | {"stop_ids": [first]}
+    queue = [("n1", frame, b"")]
+    final = None
+    while queue and final is None:
+        who, meta, payload = queue.pop(0)
+        for out in (n1 if who == "n1" else nk).handle(meta, payload):
+            if out.to == "head" and out.meta["t"] == "token":
+                final = out.meta
+            elif out.to == "next":
+                queue.append(("nk" if who == "n1" else "n1", out.meta, out.payload))
+    assert final["final"] and final["reason"] == "stop"

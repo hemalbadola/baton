@@ -1,36 +1,31 @@
-"""Forward engine: KV cache and the compute thread (PRD 6.5, 6.6).
+"""Shard loading, KV cache and the forward step (PRD 5.3, 6.5, 6.6).
 
-One instance per worker process. It owns the device, the resident shard, and
-every KV tensor. It runs exactly one compute thread, which handles one frame at
-a time in arrival order, so no lock protects the model itself.
-
-The control loop never calls into the model. It only puts jobs on `inbox` and
-takes finished frames off `outbox`. See the design note in memory.md.
+`ForwardEngine.handle` is synchronous: one frame in, a list of frames out. The
+daemon calls it through `asyncio.to_thread` from one consumer task, so frames run
+one at a time in arrival order and the heartbeat never waits on the model.
 """
 
 from __future__ import annotations
 
-import queue
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, Protocol
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Literal
+
+import torch
+
+from baton.worker.sampler import Sampler, SamplingParams
 
 if TYPE_CHECKING:  # imported for types only
-    import torch
-
-    from baton.common.messages import Frame
     from baton.model.layers import DecoderStack
     from baton.model.safetensors_io import ByteSource
     from baton.model.spec import ModelSpec
-
-JobKind = Literal["prompt", "next", "act", "release", "abort", "bench"]
 
 #: Prefill chunk width in tokens, constant by decision D10 (PRD 10.1).
 CHUNK_TOKENS = 256
 
 #: Bytes per token per layer of KV cache, both K and V, in a 2-byte compute
 #: dtype: 2 tensors * n_kv_heads * head_dim * 2 B. 4 KB is the PRD 6.5 figure
-#: for the 70B shape and is used only for the pre-allocation estimate.
+#: for the 70B shape and is used only as a default estimate.
 KV_BYTES_PER_LAYER_PER_TOKEN = 4 * 1024
 
 
@@ -82,8 +77,6 @@ def load_shard(
     quantized tiers are BAT-10; the shard cache and the memmapped embedding
     table are BAT-11.
     """
-    import torch
-
     from baton.model import safetensors_io as sio
     from baton.model.layers import DecoderStack
 
@@ -136,69 +129,52 @@ def load_shard(
     return stack.eval(), resident
 
 
-@dataclass(slots=True)
-class Job:
-    """One unit of work for the compute thread.
+_WIRE = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
 
-    A job is either a data-plane frame to run through the local layers, or a
-    lifecycle instruction. `frame` is None only for `bench`.
-    """
 
-    kind: JobKind
-    req: str
-    frame: Frame | None = None
-    t_recv_ns: int = 0
-    """`time.perf_counter_ns()` at receive, for the trace (PRD 6.6, 17.2)."""
+def to_wire(x: torch.Tensor, wire: str) -> bytes:
+    return x.to("cpu", _WIRE[wire]).contiguous().view(torch.uint8).numpy().tobytes()
+
+
+def from_wire(payload: bytes, n: int, hidden: int, wire: str) -> torch.Tensor:
+    # `bytearray` because `torch.frombuffer` wants a writable buffer.
+    return torch.frombuffer(bytearray(payload), dtype=_WIRE[wire]).view(n, hidden)
+
+
+class LayerKV:
+    """One layer's K and V rows. Satisfies `layers.LayerKVCache`."""
+
+    def __init__(self, max_len: int, n_kv_heads: int, head_dim: int, device: str, dtype: Any):
+        shape = (max_len, n_kv_heads, head_dim)
+        self.k = torch.zeros(shape, device=device, dtype=dtype)
+        self.v = torch.zeros(shape, device=device, dtype=dtype)
+
+    def append(self, k: torch.Tensor, v: torch.Tensor, pos_start: int):
+        end = pos_start + k.shape[0]
+        self.k[pos_start:end] = k
+        self.v[pos_start:end] = v
+        return self.k[:end], self.v[:end]
 
 
 @dataclass(slots=True)
 class KVEntry:
-    """The one KV tensor for one request on this worker.
-
-    Shape `[n_local_layers, 2, max_len, n_kv_heads, head_dim]` in compute
-    dtype, allocated whole on the first frame of the request so a later frame
-    can never fail midway through a generation.
-    """
+    """The KV rows of one request on this worker, allocated whole on its first frame
+    so that a later frame can never fail midway through a generation."""
 
     req: str
-    tensor: torch.Tensor
+    layers: list[LayerKV]
     max_len: int
     charged_bytes: int
-    """Bytes debited from the engine budget when this entry was allocated."""
-
-    seq_len: int = 0
-    """Rows written so far. The next frame writes at this offset."""
-
-
-class ShardRunner(Protocol):
-    """What the engine needs from the model lane (PRD 5.2), and nothing more.
-
-    Declared as a Protocol so this module does not import the kernels lane and
-    the two can be written in parallel.
-    """
-
-    n_local_layers: int
-    is_first: bool
-    """True when this worker holds layer 0 and therefore embeds (N1)."""
-
-    is_last: bool
-    """True when this worker holds the final layer and therefore samples (Nk)."""
-
-    def embed(self, ids: torch.Tensor) -> torch.Tensor: ...
-
-    def run_layers(self, x: torch.Tensor, kv: torch.Tensor, pos: int) -> torch.Tensor: ...
-
-    def sample(self, x: torch.Tensor, sampling: dict[str, object]) -> int: ...
 
 
 class KVPool:
-    """Charges KV cache memory to a per-worker budget (PRD 6.5).
+    """Charges KV memory to a per-worker budget (PRD 6.5).
 
-    Every request is charged at allocation, for its whole `max_len`, and
-    credited on release. Nothing is charged incrementally as a sequence grows,
-    because admission control on the head (PRD 7.5) reserves against the same
-    worst case. Charging late would let two admitted requests both fit at
+    Every request is charged for its whole `max_len` at allocation and credited
+    on release. Charging late would let two admitted requests both fit at
     admission and both fail at token 2000.
+
+    `bytes_per_token` counts one layer, K and V together.
     """
 
     def __init__(self, budget_bytes: int, n_local_layers: int, bytes_per_token: int) -> None:
@@ -209,117 +185,189 @@ class KVPool:
 
     @property
     def used_bytes(self) -> int:
-        """Sum of charges for live requests. Reported as `kv_used` in health."""
-        raise NotImplementedError
+        return sum(e.charged_bytes for e in self._entries.values())
 
     @property
     def free_bytes(self) -> int:
-        """Budget minus charges. Not a device query: the caching allocator
-        keeps freed blocks in its pool, so the device would under-report."""
-        raise NotImplementedError
+        return self._budget_bytes - self.used_bytes
+
+    def __len__(self) -> int:
+        return len(self._entries)
 
     def cost_bytes(self, max_len: int) -> int:
-        """Bytes this worker will charge for a request of `max_len` tokens."""
-        raise NotImplementedError
+        return self._n_local_layers * self._bytes_per_token * max_len
 
-    def allocate(self, req: str, prompt_len: int, max_tokens: int, ctx_max: int) -> KVEntry:
-        """Allocate the KV tensor on the first frame of a request.
+    def allocate(
+        self, req: str, max_len: int, n_kv_heads: int, head_dim: int, device: str, dtype: Any
+    ) -> KVEntry:
+        """Allocate on the first frame of a request. Idempotent for a known `req`.
 
-        `max_len = min(prompt_len + max_tokens, ctx_max)`. Raises
-        `OutOfMemoryOnKV` when the charge exceeds the remaining budget, or when
-        the device allocation itself fails. Idempotent for a `req` already
-        present: a retried first frame must not double charge.
+        Raises `OutOfMemoryOnKV` when the charge exceeds the remaining budget or
+        the device allocation itself fails. A failure charges nothing.
         """
-        raise NotImplementedError
+        known = self._entries.get(req)
+        if known is not None:
+            return known
+        cost = self.cost_bytes(max_len)
+        if cost > self.free_bytes:
+            raise OutOfMemoryOnKV(req, cost, self.free_bytes)
+        try:
+            layers = [
+                LayerKV(max_len, n_kv_heads, head_dim, device, dtype)
+                for _ in range(self._n_local_layers)
+            ]
+        except (RuntimeError, MemoryError) as exc:
+            raise OutOfMemoryOnKV(req, cost, self.free_bytes) from exc
+        entry = self._entries[req] = KVEntry(req, layers, max_len, cost)
+        return entry
 
     def get(self, req: str) -> KVEntry | None:
-        """Return the live entry, or None when the request is unknown."""
-        raise NotImplementedError
+        return self._entries.get(req)
 
     def release(self, req: str) -> int:
-        """Delete the tensor and credit the charge. Returns bytes credited.
+        """Credit the charge. Zero for an unknown request: `release` rings the
+        whole cluster, and a node that already aborted sees it a second time."""
+        entry = self._entries.pop(req, None)
+        return entry.charged_bytes if entry else 0
 
-        Zero for an unknown request: `release` rings the whole cluster and a
-        node that already aborted must not treat the second visit as an error.
-        The memory returns to the allocator pool, not to the OS (PRD 6.5).
-        """
-        raise NotImplementedError
+
+@dataclass(slots=True)
+class Out:
+    """One frame the engine wants sent. `to` is `next` (the ring link) or `head`."""
+
+    to: Literal["next", "head"]
+    meta: dict[str, Any]
+    payload: bytes = b""
+
+
+@dataclass(slots=True)
+class _Gen:
+    """Per-request state on Nk (PRD 10.3)."""
+
+    prompt_ids: list[int]
+    max_tokens: int
+    stop_ids: set[int]
+    sampler: Sampler
+    penalised: bool
+    gen: list[int] = field(default_factory=list)
 
 
 class ForwardEngine:
-    """The compute thread and its two queues (PRD 6.6).
+    """Runs this worker's layers for one frame at a time (PRD 6.6, 10).
 
-    `inbox` is a plain `queue.Queue` written by the control loop. `outbox`
-    carries finished frames back. The control loop is asyncio and the compute
-    thread is not, so the thread hands each frame over with
-    `loop.call_soon_threadsafe`, set up by `attach_loop`.
+    Frames in: `prompt`, `act`, `next`, `release`, `abort`. Frames out: `act`
+    to the next node, `token` and `release_ack` to the head, `next` to N1.
+    With one node the ring is this engine, and the caller feeds `next` back.
     """
 
-    def __init__(self, runner: ShardRunner, kv: KVPool, device: str) -> None:
-        self._runner = runner
-        self._kv = kv
-        self._device = device
-        self.inbox: queue.Queue[Job | None] = queue.Queue()
-        self._stopping = False
-
-    def attach_loop(self, on_frame: object) -> None:
-        """Register the control loop's thread-safe frame sink.
-
-        `on_frame` is called from the compute thread for every outbound frame.
-        It must not block: the implementation wraps
-        `loop.call_soon_threadsafe(queue.put_nowait, frame)`.
-        """
-        raise NotImplementedError
-
-    def start(self) -> None:
-        """Start the single compute thread. Idempotent."""
-        raise NotImplementedError
-
-    def stop(self, timeout_s: float = 5.0) -> None:
-        """Drain `inbox`, stop the thread, free every KV entry.
-
-        Puts the `None` sentinel rather than setting a flag, so the thread
-        wakes from a blocking `get()` without a poll timeout.
-        """
-        raise NotImplementedError
-
-    def submit(self, job: Job) -> None:
-        """Hand one job to the compute thread. Called from the control loop."""
-        raise NotImplementedError
-
-    @property
-    def queue_depth(self) -> int:
-        """Jobs waiting. Reported in health and used by head admission."""
-        raise NotImplementedError
+    def __init__(
+        self,
+        stack: DecoderStack,
+        kv: KVPool,
+        *,
+        device: str,
+        dtype: Any,
+        wire: str = "bf16",
+        ctx_max: int,
+    ) -> None:
+        self.stack = stack
+        self.kv = kv
+        self.device = device
+        self.dtype = dtype
+        self.wire = wire
+        self.ctx_max = ctx_max
+        self.is_first = stack.embed_tokens is not None
+        self.is_last = stack.lm_head is not None
+        self._gens: dict[str, _Gen] = {}
 
     @property
     def active_reqs(self) -> int:
-        """Requests with a live KV entry on this worker."""
-        raise NotImplementedError
+        return len(self.kv)
 
-    # --- compute thread internals; never called from the control loop ---
+    def drop(self, req: str) -> None:
+        """Forget a request after a failure. Safe for an unknown request."""
+        self.kv.release(req)
+        self._gens.pop(req, None)
 
-    def _run(self) -> None:
-        """The compute thread body: one blocking `get`, one frame, repeat."""
-        raise NotImplementedError
+    def handle(self, meta: dict[str, Any], payload: bytes = b"") -> list[Out]:
+        kind, req = meta["t"], meta["req"]
+        with torch.inference_mode():
+            if kind == "prompt":
+                return self._prompt(req, meta)
+            if kind == "next":
+                if self.kv.get(req) is None:  # aborted while the frame was in flight
+                    return []
+                x = self._embed([int(meta["id"])])
+                return self._run(req, x, int(meta["pos"]), True)
+            if kind == "act":
+                if self.kv.get(req) is None:
+                    return []
+                x = from_wire(payload, int(meta["n"]), self.stack.spec.hidden, meta["dtype"])
+                return self._run(req, x.to(self.device, self.dtype), int(meta["pos"]), meta["last"])
+            if kind in ("release", "abort"):
+                self.drop(req)
+                if self.is_last:
+                    return [Out("head", {"t": "release_ack", "req": req})]
+                return [Out("next", meta)]
+        raise ValueError(f"unexpected frame {kind!r}")
 
-    def _handle(self, job: Job) -> None:
-        """Dispatch one job by kind (PRD 6.6).
+    def _embed(self, ids: list[int]) -> torch.Tensor:
+        return self.stack.embed(torch.tensor(ids, device=self.device)).to(self.dtype)
 
-        - `prompt` (N1): ids to 256-token chunks, embed each, run layers, emit
-          one `act` frame per chunk.
-        - `next` (N1): embed one id, run layers, emit one `act` frame.
-        - `act`: view the payload as compute dtype, run layers, emit `act` to
-          the next node. On Nk instead: norm, lm_head on the last row, sample,
-          emit `token` to the head and `next` to N1.
-        - `release` / `abort`: free the KV entry, then forward the frame on.
-        """
-        raise NotImplementedError
+    def _prompt(self, req: str, meta: dict[str, Any]) -> list[Out]:
+        """Open the request here and pass the frame on, so that Nk learns
+        `max_len`, `sampling` and `stop_ids` before the first `act` arrives. The
+        link is FIFO. Nk does not forward: the ring would bring it back to N1."""
+        spec = self.stack.spec
+        ids = [int(i) for i in meta["ids"]]
+        max_len = min(int(meta["max_len"]), self.ctx_max)
+        self.kv.allocate(req, max_len, spec.n_kv_heads, spec.head_dim, self.device, self.dtype)
+        outs: list[Out] = []
+        if self.is_last:
+            params = SamplingParams(**meta.get("sampling", {}))
+            self._gens[req] = _Gen(
+                prompt_ids=ids,
+                max_tokens=max_len - len(ids),
+                stop_ids={int(i) for i in meta.get("stop_ids", [])},
+                sampler=Sampler(params, device=self.device),
+                penalised=params.repetition_penalty != 1.0,
+            )
+        else:
+            outs.append(Out("next", meta))
+        if self.is_first:
+            for start in range(0, len(ids), CHUNK_TOKENS):
+                chunk = ids[start : start + CHUNK_TOKENS]
+                last = start + len(chunk) == len(ids)
+                outs += self._run(req, self._embed(chunk), start, last)
+        return outs
 
-    def _stamp_trace(self, job: Job, frame: Frame) -> None:
-        """Append `{node, t_recv}` and add `t_send` to that entry.
+    def _run(self, req: str, x: torch.Tensor, pos: int, last: bool) -> list[Out]:
+        entry = self.kv.get(req)
+        assert entry is not None
+        # `last_only` matters on Nk, where a 256-row chunk needs one logits row.
+        y = self.stack(x, pos_start=pos, cache=entry.layers, last_only=True)
+        if not self.is_last:
+            meta = {
+                "t": "act",
+                "req": req,
+                "pos": pos,
+                "n": x.shape[0],
+                "dtype": self.wire,
+                "last": last,
+            }
+            return [Out("next", meta, to_wire(y, self.wire))]
+        return self._sample(req, y, pos + x.shape[0]) if last else []
 
-        Timestamps are `perf_counter_ns()` on this node only. Absolute clocks
-        are never compared across nodes (PRD 17.2).
-        """
-        raise NotImplementedError
+    def _sample(self, req: str, logits: torch.Tensor, pos: int) -> list[Out]:
+        """Nk: pick the token for position `pos`, then send it both ways (PRD 10.2)."""
+        r = self._gens[req]
+        seen = [*r.prompt_ids, *r.gen] if r.penalised else ()
+        tid = r.sampler.sample(logits, seen=seen)
+        r.gen.append(tid)
+        stopped = tid in r.stop_ids
+        final = stopped or len(r.gen) >= r.max_tokens
+        token: dict[str, Any] = {"t": "token", "req": req, "id": tid, "pos": pos, "final": final}
+        if final:
+            token["reason"] = "stop" if stopped else "length"
+            return [Out("head", token), Out("next", {"t": "release", "req": req})]
+        return [Out("head", token), Out("next", {"t": "next", "req": req, "id": tid, "pos": pos})]

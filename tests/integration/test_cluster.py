@@ -81,9 +81,9 @@ async def test_cluster_forms_over_mdns_and_survives_a_lost_worker(cluster) -> No
             got = nk.stack(n1.stack(n1.stack.embed(ids)))
             assert torch.equal(got, reference(reference.embed(ids)))
 
-        # The ring link is open and authenticated: N1 dialled Nk's data port.
-        await until(lambda: len(nk._inbound) == 1, timeout=5)
-        assert n1._next is not None and nk._next is None
+        # The ring is closed and authenticated: N1 dialled Nk, and Nk dialled N1.
+        await until(lambda: len(nk._inbound) == 1 and len(n1._inbound) == 1, timeout=5)
+        assert n1._next is not None and nk._next is not None
 
         # Nk dies. The head notices, leaves READY, and waits for a second worker.
         tasks[nk.name].cancel()

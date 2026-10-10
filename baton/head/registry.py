@@ -93,6 +93,7 @@ class Health:
     kv_used_bytes: int
     queue_depth: int
     loaded_rev: int | None = None
+    compute_ms: list[float] = field(default_factory=list)
 
     @classmethod
     def from_frame(cls, meta: dict[str, Any], at: float) -> Health:
@@ -102,12 +103,14 @@ class Health:
         arrival time decides a timeout, not a timestamp inside the frame.
         """
         rev = meta.get("loaded_rev")
+        times = meta.get("compute_ms")
         return cls(
             at=at,
             free_bytes=_as_int(meta.get("mem_free")),
             kv_used_bytes=_as_int(meta.get("kv_used")),
             queue_depth=_as_int(meta.get("queue_depth")),
             loaded_rev=None if rev is None else _as_int(rev),
+            compute_ms=[_as_float(v) for v in times][-12:] if isinstance(times, list) else [],
         )
 
 

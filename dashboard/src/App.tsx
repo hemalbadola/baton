@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { SAMPLE } from "./sample";
+import { useEffect, useState } from "react";
+import type { ClusterSnapshot } from "./types";
 import { Topology } from "./views/Topology";
 import { Live } from "./views/Live";
 import { Plan } from "./views/Plan";
@@ -9,10 +9,35 @@ import { Log } from "./views/Log";
 const VIEWS = ["Topology", "Live", "Plan", "Chat", "Log"] as const;
 type View = (typeof VIEWS)[number];
 
+/** The head pushes one snapshot at 2 Hz on /ws (PRD 14.1). Reconnects when it drops. */
+function useCluster(): ClusterSnapshot | null {
+  const [snap, setSnap] = useState<ClusterSnapshot | null>(null);
+  useEffect(() => {
+    const scheme = location.protocol === "https:" ? "wss" : "ws";
+    let socket: WebSocket;
+    let closed = false;
+    const open = () => {
+      socket = new WebSocket(`${scheme}://${location.host}/ws`);
+      socket.onmessage = (e) => setSnap(JSON.parse(e.data));
+      socket.onclose = () => {
+        if (!closed) setTimeout(open, 1000);
+      };
+    };
+    open();
+    return () => {
+      closed = true;
+      socket.close();
+    };
+  }, []);
+  return snap;
+}
+
 export default function App() {
   const [view, setView] = useState<View>("Topology");
-  // Static shell: one hardcoded snapshot. M3 replaces this with /cluster + /ws.
-  const snap = SAMPLE;
+  const snap = useCluster();
+  if (!snap) {
+    return <p className="muted" style={{ padding: 24 }}>Connecting to the head...</p>;
+  }
 
   return (
     <div className="app">
@@ -44,7 +69,9 @@ export default function App() {
         {view === "Log" && <Log snap={snap} />}
       </main>
 
-      <footer className="muted">Sample data. Live wiring lands in M3.</footer>
+      <footer className="muted">
+        {snap.nodes.length} node(s) &middot; {snap.live.active} active &middot; {snap.live.queued} queued
+      </footer>
     </div>
   );
 }

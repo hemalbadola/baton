@@ -1,7 +1,5 @@
 """Incremental detokenization on the head. PRD 7.4.
 
-M1 interface only. Every body raises NotImplementedError.
-
 The head holds the tokenizer, the workers do not. Nk sends token ids, the head
 turns them into the text of an SSE chunk. Two problems make this more than one
 `decode` call per token:
@@ -41,7 +39,7 @@ class Emission:
     @property
     def finished(self) -> bool:
         """True when a stop string ended this response."""
-        raise NotImplementedError
+        return self.stop is not None
 
 
 @dataclass
@@ -61,16 +59,52 @@ class IncrementalDetokenizer:
     prefix_start: int = 0
     prev_text: str = ""
     emitted: str = ""
+    pending: str = ""
 
     def push(self, token_id: int) -> Emission:
         """Append one id and return the text that it completes.
 
         Returns an empty `text` when the decode ends in U+FFFD: the character
-        is incomplete, so the head waits for the next token. Sets `stop` when
-        the emitted text plus this piece contains a stop string, and truncates
-        the piece so that no text after the stop string is ever returned.
+        is incomplete, so the head waits for the next token. Text that could be
+        the start of a stop string is held back in `pending` until the next
+        token shows what it is, so a stop string that spans tokens never leaks
+        its first half. Sets `stop` when a stop string completes, and returns
+        only the text before it.
         """
-        raise NotImplementedError
+        self.ids.append(token_id)
+        full = self.tokenizer.decode(self.ids[self.prefix_start :])
+        if full.endswith(REPLACEMENT_CHAR):
+            return Emission("")
+        piece = full[len(self.prev_text) :]
+        self.prev_text = full
+        if len(self.ids) - self.prefix_start >= PREFIX_ADVANCE_EVERY:
+            self.advance_prefix()
+        found = self.find_stop(piece)
+        if found is not None:
+            stop, kept = found
+            self.pending = ""
+            self.emitted += kept
+            return Emission(kept, stop)
+        window = self.pending + piece
+        hold = max(
+            (
+                k
+                for stop in self.stop_strings
+                for k in range(1, len(stop))
+                if window.endswith(stop[:k])
+            ),
+            default=0,
+        )
+        out = window[: len(window) - hold]
+        self.pending = window[len(window) - hold :]
+        self.emitted += out
+        return Emission(out)
+
+    def flush(self) -> str:
+        """The held-back text, once the response ended without that stop string."""
+        out, self.pending = self.pending, ""
+        self.emitted += out
+        return out
 
     def advance_prefix(self) -> None:
         """Move `prefix_start` to the last safe boundary (PRD 7.4).
@@ -79,21 +113,26 @@ class IncrementalDetokenizer:
         decode constant in the length of the response. A safe boundary is a
         position whose decode does not end in U+FFFD.
         """
-        raise NotImplementedError
+        if not self.prev_text.endswith(REPLACEMENT_CHAR):
+            self.prefix_start = len(self.ids)
+            self.prev_text = ""
 
     def find_stop(self, candidate: str) -> tuple[str, str] | None:
-        """Match the stop strings against the tail of the emitted text.
+        """Match the stop strings against the held text plus `candidate`.
 
-        Only the last `max(len(s) for s in stop_strings)` characters of the
-        emitted text plus `candidate` need a check. Returns
-        `(stop_string, kept_text)`, where `kept_text` is the part of `candidate`
-        before the stop string. Returns None when no stop string matched.
+        Returns `(stop_string, kept_text)`, where `kept_text` is the part of
+        the window before the stop string. Returns None when none matched.
         """
-        raise NotImplementedError
+        window = self.pending + candidate
+        hits = [(i, s) for s in self.stop_strings if (i := window.find(s)) >= 0]
+        if not hits:
+            return None
+        at, stop = min(hits)
+        return stop, window[:at]
 
     def text(self) -> str:
         """Every character emitted so far for this request."""
-        raise NotImplementedError
+        return self.emitted
 
 
 def single_token_stop_ids(tokenizer: Any, stop_strings: Sequence[str]) -> set[int]:
@@ -103,4 +142,9 @@ def single_token_stop_ids(tokenizer: Any, stop_strings: Sequence[str]) -> set[in
     and computes no token after the stop. Every other stop string is matched
     here on the head, which costs one race window of dropped tokens.
     """
-    raise NotImplementedError
+    ids: set[int] = set()
+    for stop in stop_strings:
+        encoded = tokenizer.encode(stop, add_special_tokens=False)
+        if len(encoded) == 1:
+            ids.add(int(encoded[0]))
+    return ids

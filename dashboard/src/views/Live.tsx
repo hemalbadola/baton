@@ -1,6 +1,5 @@
 import type { ClusterSnapshot } from "../types";
 import { ms } from "../format";
-import { SAMPLE_COMPUTE_MS } from "../sample";
 
 /** tok/s, TTFT, active requests, queue depth, per-node sparkline (PRD 14.2). */
 export function Live({ snap }: { snap: ClusterSnapshot }) {
@@ -29,7 +28,7 @@ export function Live({ snap }: { snap: ClusterSnapshot }) {
               <td>{n.name}</td>
               <td className="muted">{n.backend}</td>
               <td>
-                <Sparkline values={SAMPLE_COMPUTE_MS[n.name] ?? []} />
+                <Sparkline values={n.compute_ms ?? []} />
               </td>
               <td className="num">{ms(n.stage_ms.p50)}</td>
             </tr>

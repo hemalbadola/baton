@@ -1,59 +1,57 @@
-"""KV cache accounting tests (PRD 6.5).
-
-Skeleton for M1. These are the tests that protect the memory charge, which is
-the one place a worker can silently over-commit and OOM mid-generation.
-"""
+"""KV cache accounting tests (PRD 6.5). These protect the one place where a
+worker can silently over-commit and run out of memory mid-generation."""
 
 import pytest
+import torch
 
-pytestmark = pytest.mark.skip(reason="M1 interface only; KVPool not implemented")
+from baton.worker.engine import KVPool, OutOfMemoryOnKV
 
-
-class TestMaxLen:
-    def test_max_len_is_prompt_plus_max_tokens(self) -> None:
-        """The tensor covers the whole generation, allocated once."""
-
-    def test_max_len_is_capped_at_ctx_max(self) -> None:
-        """A request asking beyond the loaded context is clamped, not refused
-        here: the head owns refusal."""
+LAYERS, PER_TOKEN = 4, 2 * 2 * 16 * 4  # 4 layers; K and V, 2 kv heads, head_dim 16, fp32
 
 
-class TestCharging:
-    def test_cost_matches_the_prd_worked_example(self) -> None:
-        """24 local layers at max_len 4096 charges 403 MB (PRD 6.5)."""
-
-    def test_charge_is_taken_in_full_at_allocation(self) -> None:
-        """Charging as the sequence grows would let two admitted requests both
-        fit at admission and both fail at token 2000."""
-
-    def test_release_credits_the_exact_charge(self) -> None:
-        """used_bytes returns to its prior value, so no charge leaks."""
-
-    def test_used_bytes_is_the_sum_over_live_requests(self) -> None:
-        """This is the `kv_used` field of health (PRD 8.3)."""
-
-    def test_free_bytes_ignores_the_allocator_pool(self) -> None:
-        """Freed device blocks stay in the caching allocator, so a device query
-        would under-report free budget (PRD 6.5)."""
+def pool(budget: int) -> KVPool:
+    return KVPool(budget, LAYERS, PER_TOKEN)
 
 
-class TestOom:
-    def test_allocation_over_budget_raises_out_of_memory_on_kv(self) -> None:
-        """The daemon turns this into `error{req, code="oom"}`."""
-
-    def test_failed_allocation_charges_nothing(self) -> None:
-        """A rejected request must not leave a phantom charge behind."""
-
-    def test_device_oom_is_wrapped_not_propagated(self) -> None:
-        """A backend OOM and a budget OOM reach the head as the same code."""
+def alloc(p: KVPool, req: str, max_len: int):
+    return p.allocate(req, max_len, 2, 16, "cpu", torch.float32)
 
 
-class TestLifecycle:
-    def test_allocate_is_idempotent_for_a_known_request(self) -> None:
-        """A retried first frame must not double charge."""
+def test_cost_is_layers_times_bytes_times_length() -> None:
+    assert pool(10**9).cost_bytes(100) == LAYERS * PER_TOKEN * 100
 
-    def test_release_of_an_unknown_request_is_a_no_op(self) -> None:
-        """`release` rings the whole cluster; a second visit is normal."""
 
-    def test_abort_frees_the_tensor_like_release(self) -> None:
-        """Both paths must reach zero charge for the request."""
+def test_the_whole_charge_is_taken_at_allocation_and_credited_on_release() -> None:
+    p = pool(10**9)
+    alloc(p, "a", 50)
+    assert p.used_bytes == p.cost_bytes(50)
+    assert p.free_bytes == 10**9 - p.cost_bytes(50)
+    assert p.release("a") == p.cost_bytes(50)
+    assert p.used_bytes == 0
+
+
+def test_used_bytes_sums_live_requests() -> None:
+    p = pool(10**9)
+    alloc(p, "a", 10)
+    alloc(p, "b", 20)
+    assert p.used_bytes == p.cost_bytes(30)
+    assert len(p) == 2
+
+
+def test_an_allocation_over_budget_raises_and_charges_nothing() -> None:
+    p = pool(1000)
+    with pytest.raises(OutOfMemoryOnKV) as err:
+        alloc(p, "a", 100)
+    assert err.value.req == "a"
+    assert p.used_bytes == 0 and p.get("a") is None
+
+
+def test_a_retried_first_frame_does_not_charge_twice() -> None:
+    p = pool(10**9)
+    first = alloc(p, "a", 10)
+    assert alloc(p, "a", 10) is first
+    assert p.used_bytes == p.cost_bytes(10)
+
+
+def test_release_of_an_unknown_request_is_a_no_op() -> None:
+    assert pool(10).release("never") == 0

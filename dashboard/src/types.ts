@@ -35,6 +35,8 @@ export interface NodeSnapshot {
   stage_ms: { p50: number; p95: number };
   queue_depth: number;
   state: NodeState;
+  /** Extension: the last decode steps on this node, oldest first. */
+  compute_ms?: number[];
 }
 
 export interface LiveStats {
