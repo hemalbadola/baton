@@ -99,3 +99,22 @@ def test_impossible_geometry_is_refused():
         make_spec("llama-3.2-1b", num_key_value_heads=7)
     with pytest.raises(ValueError, match="even"):
         make_spec("llama-3.2-1b", head_dim=63)
+
+
+def test_qwen2_config_without_attention_bias_key_has_biases() -> None:
+    """Qwen2 configs carry no `attention_bias`, yet q, k and v have biases. Dropping
+    them gave garbage text from a real Qwen2.5-0.5B (BAT-40)."""
+    from baton.model.spec import ModelSpec
+
+    config = {
+        "model_type": "qwen2",
+        "hidden_size": 896,
+        "intermediate_size": 4864,
+        "num_hidden_layers": 24,
+        "num_attention_heads": 14,
+        "num_key_value_heads": 2,
+        "vocab_size": 151936,
+        "tie_word_embeddings": True,
+    }
+    assert ModelSpec.from_config(config).attn_bias
+    assert not ModelSpec.from_config(config | {"model_type": "llama"}).attn_bias

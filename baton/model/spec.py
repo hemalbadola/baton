@@ -145,7 +145,9 @@ class ModelSpec:
             rms_eps=float(config.get("rms_norm_eps", 1e-6)),
             rope_theta=float(config.get("rope_theta", 10000.0)),
             rope_scaling=config.get("rope_scaling") or None,
-            attn_bias=bool(config.get("attention_bias", False)),
+            # Qwen2 configs carry no `attention_bias` key: the architecture
+            # has q, k and v biases by definition (Hugging Face hard-codes them).
+            attn_bias=bool(config.get("attention_bias", config.get("model_type") == "qwen2")),
             tie_embeddings=bool(config.get("tie_word_embeddings", False)),
             max_position=int(config.get("max_position_embeddings", 8192)),
         )
