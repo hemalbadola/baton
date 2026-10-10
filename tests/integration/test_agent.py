@@ -108,6 +108,7 @@ async def test_a_room_forms_from_nearby_laptops_with_no_command() -> None:
         serve = a_ran[0]
         assert serve[0] == "serve" and serve[serve.index("--model") + 1] == "Qwen/x"
         assert serve[serve.index("--min-workers") + 1] == "2"
+        assert serve[serve.index("--objective") + 1] == "balance"  # spread is the default
         assert b.state == "joined"
         assert b_ran[0][:2] == ["worker", "--head"] and b_ran[0][2].endswith(":7711")
         assert b_ran[0][-2:] == ["--name", "beta"]

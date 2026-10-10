@@ -66,6 +66,10 @@ class Room:
     """The room this laptop hosts."""
 
     model: str
+    spread: bool = True
+    """Split the model across every laptop. Off, the planner may keep the whole model on the
+    fastest laptop that fits it, which leaves the others idle."""
+
     invited: dict[str, str] = field(default_factory=dict)  # peer name -> invite id
     accepted: dict[str, dict[str, str]] = field(default_factory=dict)  # name -> {addr, id}
 
@@ -222,6 +226,7 @@ class Agent:
             "room": room
             and {
                 "model": room.model,
+                "spread": room.spread,
                 "invited": sorted(set(room.invited) - set(room.accepted)),
                 "accepted": sorted(room.accepted),
             },
@@ -269,7 +274,7 @@ class Agent:
             model = str(body.get("model", "")).strip()
             if not model:
                 return bad("pick a model")
-            self.room = Room(model)
+            self.room = Room(model, spread=bool(body.get("spread", True)))
             self.state = "lobby"
             return {"ok": True}
 
@@ -329,6 +334,7 @@ class Agent:
                     str(self.head_http),
                     "--control-port",
                     str(self.control_port),
+                    *(["--objective", "balance"] if room.spread else []),
                 ],
                 "hosting",
             )

@@ -68,6 +68,10 @@ details pre { margin:8px 0 0; padding:10px; background:#0f1115; border-radius:8p
       </div>
       <button class="primary" id="host">Host this model</button>
     </div>
+    <label class="muted" style="display:block;margin-top:12px">
+      <input type="checkbox" id="spread" checked>
+      Split the model across every laptop, even if one laptop could hold it
+    </label>
     <p class="muted" style="margin-bottom:0">Or wait: the laptop that hosts will invite this one. An invitation shows up above.</p>
   </section>
 
@@ -195,7 +199,7 @@ document.addEventListener("click", e => {
   if (t.dataset.decline) act("/api/decline", {id: t.dataset.decline});
   if (t.dataset.invite) act("/api/invite", {peer: t.dataset.invite});
 });
-$("host").onclick = () => act("/api/room", {model: $("model").value});
+$("host").onclick = () => act("/api/room", {model: $("model").value, spread: $("spread").checked});
 $("start").onclick = () => act("/api/start", {});
 $("cancel").onclick = () => act("/api/stop", {});
 $("stop").onclick = () => { history.length = 0; $("transcript").innerHTML = ""; act("/api/stop", {}); };
