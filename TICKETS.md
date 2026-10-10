@@ -48,6 +48,10 @@ This file is the ticket system for the project. Every change starts as a ticket 
 | BAT-35 | Task | Check the model fetch against the real Hugging Face | DONE |
 | BAT-36 | Task | Publish: commit the work, push, make the repository public | DONE |
 | BAT-37 | Task | Host the web page | DONE |
+| BAT-38 | Story | Generate tokens around the ring | DONE |
+| BAT-39 | Story | OpenAI API, streaming, and the live dashboard | DONE |
+| BAT-40 | Bug | Qwen2 attention biases are dropped, the text is garbage | DONE |
+| BAT-41 | Story | `baton app`: one page per laptop, find nearby laptops, host or join | DONE |
 | BAT-10 | Story | Run int8 and int4 weights in the decoder | BACKLOG |
 | BAT-11 | Story | Use the shard cache on load, memmap the embedding table | BACKLOG |
 | BAT-12 | Story | Measure round-trip time between workers (`ping_peer`) | BACKLOG |
@@ -345,6 +349,71 @@ This file is the ticket system for the project. Every change starts as a ticket 
 - **Result:** DONE. `web/` is on Vercel (project `baton`) at `https://baton-plum.vercel.app`.
   The page and the two fonts return 200. To publish a change: `cd web && vercel deploy --prod`.
 - **Files:** `web/.gitignore`
+
+### BAT-38 — Generate tokens around the ring
+- **Why:** Until now the cluster formed and loaded, but no text came out.
+- **Scope:** `ForwardEngine`, `KVPool` in `baton/worker/engine.py`; the frame pump in
+  `baton/worker/daemon.py`; `Driver`, `Admission` in `baton/head/driver.py`;
+  `IncrementalDetokenizer` in `baton/head/detok.py`; ring closing in `Head.load_plan`.
+- **Decisions:** Nk dials N1 so `next` and `release` ride the ring (PRD 10.2). `prompt`,
+  `abort`, `token`, `release_ack` and request `error` use the control socket, not a second
+  data listener: it exists and is authenticated. Text that could start a stop string is held
+  back until the next token (PRD 7.4 leaks the first half).
+- **Done when:** `pytest tests/integration/test_generate.py` passes: a head and two workers
+  produce the same seeded tokens as the whole model in one process, with a 13-token prompt in
+  three chunks, a stop id, a stop string, a client that leaves, and a worker lost mid-reply.
+- **Files:** `baton/worker/engine.py`, `baton/worker/daemon.py`, `baton/head/driver.py`,
+  `baton/head/detok.py`, `baton/head/serve.py`, `tests/integration/test_generate.py`,
+  `tests/unit/test_engine.py`, `tests/unit/test_kv_pool.py`, `tests/unit/test_detok.py`,
+  `tests/unit/test_driver.py`
+- **Result:** DONE. Real run: Qwen2.5-0.5B-Instruct on two workers (`mps`, bf16), 26 tok/s,
+  TTFT 0.6 to 0.8 s. A worker killed mid-reply gives `worker_lost` in the stream, then a new
+  worker makes plan 2 and the next reply works.
+
+### BAT-39 — OpenAI API, streaming, and the live dashboard
+- **Scope:** `baton/head/api.py` (`/v1/chat/completions`, `/v1/completions`, `/v1/models`,
+  `/healthz`, `/cluster`, `/ws`, SSE), `Head.start_http`, `dashboard/src/App.tsx`,
+  `dashboard/src/views/Chat.tsx`.
+- **Decisions:** `websockets` joins the `head` extra, because uvicorn has no WebSocket server
+  without it. The CLI default `--quant` is `none` until BAT-10. The Live view draws the last
+  decode steps that each worker reports in `health.compute_ms`.
+- **Done when:** `curl` and the dashboard chat get a streamed answer from a ready cluster;
+  `/cluster` shows the plan; `/healthz` is 503 when a worker is lost.
+- **Result:** DONE. `dashboard/dist` is served at `/` by `baton serve` when it is built
+  (`cd dashboard && npm install && npm run build`).
+
+### BAT-40 — Qwen2 attention biases are dropped, the text is garbage
+- **Problem:** A real Qwen2.5-0.5B gave `HandlerContextYM fontStyle ...` while the ring and
+  every synthetic test passed.
+- **Cause:** Qwen2 configs have no `attention_bias` key, yet q, k and v have biases.
+  `ModelSpec.from_config` read the key with default `False`. Layer 0 differed from Hugging Face
+  by 1.2, layer 2 by 480.
+- **Fix:** `attn_bias` defaults to `model_type == "qwen2"`. Test:
+  `test_qwen2_config_without_attention_bias_key_has_biases`.
+- **Result:** DONE. All 24 layers now equal Hugging Face, and 12 greedy tokens match on `cpu`
+  fp32 and `mps` bf16.
+- **Files:** `baton/model/spec.py`, `tests/numerics/test_spec.py`
+
+### BAT-41 — `baton app`: find nearby laptops, host or join, with no other command
+- **Why:** The demo must not need a terminal on every laptop. Two commands (`serve`, `worker`)
+  and flags were too much.
+- **Scope:** `baton/agent.py` (agent, mDNS `_baton-node._tcp`, invite flow, subprocess control,
+  proxy to the head), `baton/agent_ui.html` (one file, no build step), `baton app` in
+  `baton/cli.py`, install page and `install.sh` hand out `app`.
+- **Flow:** open the page on every laptop. One person picks a model and creates a room, then
+  invites nearby laptops. Each invited person clicks Accept. The host clicks Start. The agents
+  run `baton serve` and `baton worker` themselves. Chat works on every laptop.
+- **Safety:** an agent never runs a received command. A peer can send an invite (shown to the
+  user), an accept (only for an invite this laptop sent), and a join (only for an invite the user
+  accepted, and only from the laptop that sent it).
+- **Decisions:** all head dependencies (fastapi, uvicorn, transformers) are now base
+  dependencies, because any laptop can host. The page is plain HTML so a pip install carries it.
+- **Done when:** `pytest tests/integration/test_agent.py` passes, and a real run of two agents
+  reaches READY and answers a chat through the guest's page.
+- **Result:** DONE. Real run: agents `alpha` and `beta`, invite, accept, start, READY, answer in
+  190 ms to first token. Not run on two physical laptops, or on Windows.
+- **Files:** `baton/agent.py`, `baton/agent_ui.html`, `baton/cli.py`, `pyproject.toml`,
+  `install.sh`, `web/index.html`, `tests/integration/test_agent.py`
 
 ### BAT-10 — Run int8 and int4 weights in the decoder (BACKLOG)
 - `quant.py` can quantize, but `layers.py` runs dense weights only. Until this is done,

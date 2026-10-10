@@ -1,8 +1,9 @@
 [project]
-name = "baton"
-version = "0.0.0"
+name = "baton-cluster"
+version = "0.1.0"
 description = "LAN-distributed LLM inference. One model, many laptops, one relay."
 requires-python = ">=3.11"
+readme = "README.md"
 dependencies = [
     "torch",
     "numpy",
@@ -11,14 +12,26 @@ dependencies = [
     "httpx",
     "psutil",
     "typer",
+    # Any laptop can host, so every install carries the head's parts (BAT-41).
+    "fastapi",
+    "uvicorn",
+    "websockets",
+    "transformers",
+    "jinja2",
 ]
 
 [project.optional-dependencies]
-head = ["fastapi", "uvicorn", "transformers", "jinja2"]
 dev = ["pytest", "ruff"]
+
+[project.urls]
+Homepage = "https://github.com/hemalbadola/baton"
+Source = "https://github.com/hemalbadola/baton"
 
 [project.scripts]
 baton = "baton.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["baton"]
 
 [build-system]
 requires = ["hatchling"]

@@ -196,7 +196,7 @@ footer nav{display:flex;gap:24px}
         </div>
       </fieldset>
 
-      <fieldset>
+      <fieldset hidden>
         <legend>This laptop will</legend>
         <div class="seg">
           <label><input type="radio" name="role" value="start" checked>Start the cluster</label>
@@ -273,7 +273,7 @@ READY: plan 1 is loaded on 2 node(s)</pre>
     <details><summary>Windows asks about the firewall</summary><p>Choose Allow on private networks. The laptops must be able to reach each other, and Windows blocks that by default.</p></details>
     <details><summary>Does anything leave my network?</summary><p>The model is downloaded from Hugging Face once. Your prompts and answers stay on your laptops.</p></details>
     <details><summary>Is it fast?</summary><p>It is slower than one large GPU. The point is to run a model that no single laptop can hold.</p></details>
-    <details><summary>Which models work today?</summary><p>Llama 3.2 1B at full precision. Larger models need 4-bit weights, which are in progress.</p></details>
+    <details><summary>Which models work today?</summary><p>Llama 3.2 and Qwen 2.5 up to 3B at full precision. Larger models need 4-bit weights, which are in progress.</p></details>
   </div>
 </div></section>
 </main>
@@ -317,14 +317,13 @@ function render(){
     el.className = "fit " + (el.dataset.ready !== "true" ? "off" : ok ? "ok" : "no");
     el.textContent = el.dataset.ready !== "true" ? `${gb} GB, not ready yet` : ok ? `${gb} GB, fits` : `needs ${Math.ceil(gb / 0.8 - mem)} GB more`;
   });
-  $("model-field").hidden = role === "join";
+  $("model-field").hidden = true; // the page that opens picks the model
   $("shell").textContent = os === "win" ? "PowerShell" : "Terminal";
-  $("role-hint").textContent = role === "start" ? "Do this on one laptop only. It also joins as the first worker." : "Do this on every other laptop. No model to pick: the first laptop decides.";
-  const run = role === "start" ? `serve --model ${model.id} --quant none --min-workers 2` : "worker";
+  const run = "app"; // one command for every laptop: a page opens, no other command
   const command = COMMAND[os](run), box = $("cmd");
   if (box.textContent && box.textContent !== command) { box.classList.remove("flash"); void box.offsetWidth; box.classList.add("flash"); }
   box.textContent = command;
-  $("note").textContent = role === "start" && room < model.gb ? `${model.name} needs more memory than ${mem} GB. Baton will wait until more laptops join.` : "";
+  $("note").textContent = "Run this on every laptop. A page opens. On one laptop, pick a model and invite the others.";
 }
 const detected = /Win/i.test(navigator.userAgent) ? "win" : "mac";
 form.elements.os.value = detected;

@@ -1,16 +1,51 @@
 # Baton
 
-LAN-distributed LLM inference. Cut one large model into shards, put one shard on
-each laptop, pass activations device to device like a relay baton.
+Run one large language model across several laptops on the same Wi-Fi. Each laptop holds
+a few layers of the model and passes activations to the next laptop, like a relay baton.
 
-The full build spec is `../PRD.md`. Read section 0 first. The module layout in
-this repository follows PRD section 15.5, file for file.
+## Install
 
-Current milestone: **M0 Spike** (PRD 19). Exit test:
+On every laptop, one line. A page opens in the browser.
 
 ```
-pytest tests/numerics
+# macOS or Linux
+curl -LsSf https://raw.githubusercontent.com/hemalbadola/baton/main/install.sh | sh -s -- app
+
+# Windows (PowerShell)
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/hemalbadola/baton/main/install.ps1))) app
+
+# any system with Python 3.11 or newer
+pip install baton-cluster
+baton app
+
+# macOS or Linux with Homebrew
+brew install hemalbadola/baton/baton
+baton app
 ```
 
-plus 64 greedy tokens of Llama-3.2-1B identical across one process and two
-processes, and a measured per-frame overhead under 0.1 ms.
+## Use
+
+1. Run `baton app` on every laptop. Each laptop shows the others that are nearby.
+2. On one laptop, pick a model and click **Host this model**. Invite the nearby laptops.
+3. On each other laptop, click **Accept**.
+4. On the host, click **Start**. Chat when the cluster is ready.
+
+The API is OpenAI compatible: `http://<host>:7700/v1`. The first start downloads the model.
+Only bf16 weights load today (`--quant none`).
+
+## Commands
+
+```
+baton app                                 # the page above
+baton serve --model Qwen/Qwen2.5-0.5B-Instruct --quant none --min-workers 2
+baton worker                              # joins a head found over mDNS
+```
+
+## Develop
+
+```
+pip install -e ".[dev]"
+pytest
+```
+
+Design: see `TICKETS.md`. Tests need the sandbox off for sockets and mDNS.

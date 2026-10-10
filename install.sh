@@ -2,7 +2,7 @@
 # Install the `baton` command on macOS or Linux, then run it with any arguments given.
 #
 #   curl -LsSf https://raw.githubusercontent.com/hemalbadola/baton/main/install.sh | sh
-#   curl -LsSf https://raw.githubusercontent.com/hemalbadola/baton/main/install.sh | sh -s -- worker
+#   curl -LsSf https://raw.githubusercontent.com/hemalbadola/baton/main/install.sh | sh -s -- app
 #
 # The second form is what the web page hands out: one line installs and starts.
 # BATON_SOURCE overrides where Baton comes from: a directory, a URL, or a git+https address.
@@ -18,7 +18,7 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 
 echo "baton: installing from $SOURCE"
-uv tool install --quiet --force --python 3.11 --from "$SOURCE" baton
+uv tool install --quiet --force --python 3.11 --from "$SOURCE" baton-cluster
 BIN="$(uv --color never tool dir --bin)"
 
 # Put the command on PATH for new terminals, but only when it is not there yet:
@@ -31,4 +31,4 @@ esac
 if [ "$#" -gt 0 ]; then
     exec "$BIN/baton" "$@"
 fi
-echo "baton: installed. Open a new terminal, then run: baton --help"
+echo "baton: installed. Open a new terminal, then run: baton app"
