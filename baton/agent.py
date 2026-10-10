@@ -29,7 +29,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
-from baton.common.net import CONTROL_PORT
+from baton.common.net import CONTROL_PORT, lan_addresses
 
 AGENT_PORT = 7800
 HEAD_HTTP_PORT = 7700
@@ -148,8 +148,6 @@ class Agent:
     async def start_discovery(self) -> None:
         from zeroconf import ServiceInfo, ServiceStateChange
         from zeroconf.asyncio import AsyncServiceBrowser, AsyncServiceInfo, AsyncZeroconf
-
-        from baton.head.serve import lan_addresses
 
         self._zc = AsyncZeroconf()
         info = ServiceInfo(

@@ -36,6 +36,7 @@ from baton.common.net import (
     LinkClosed,
     close_writer,
     format_addr,
+    lan_addresses,
     parse_addr,
     read_frame,
     send_frame,
@@ -195,21 +196,6 @@ def eos_ids(config: dict[str, Any], tokenizer: Any) -> frozenset[int]:
         if isinstance(eot, int) and eot != tokenizer.unk_token_id:
             found.add(eot)
     return frozenset(int(i) for i in found)
-
-
-def lan_addresses() -> list[str]:
-    """Every IPv4 address a LAN peer could dial, or loopback when there is none."""
-    import psutil
-
-    up = {name for name, stats in psutil.net_if_stats().items() if stats.isup}
-    found = [
-        addr.address
-        for name, addrs in psutil.net_if_addrs().items()
-        if name in up
-        for addr in addrs
-        if addr.family == socket.AF_INET and not addr.address.startswith(("127.", "169.254."))
-    ]
-    return found or ["127.0.0.1"]
 
 
 def _echo(line: str) -> None:

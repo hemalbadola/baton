@@ -329,3 +329,18 @@ async def accept_data_link(
     """
     set_nodelay(writer)
     await recv_preamble(reader, cluster_id, token, timeout=timeout)
+
+
+def lan_addresses() -> list[str]:
+    """Every IPv4 address a LAN peer could dial, or loopback when there is none."""
+    import psutil
+
+    up = {name for name, stats in psutil.net_if_stats().items() if stats.isup}
+    found = [
+        addr.address
+        for name, addrs in psutil.net_if_addrs().items()
+        if name in up
+        for addr in addrs
+        if addr.family == socket.AF_INET and not addr.address.startswith(("127.", "169.254."))
+    ]
+    return found or ["127.0.0.1"]

@@ -12,6 +12,7 @@ Configuration precedence (PRD 15.2): CLI flag > BATON_* env var >
 from __future__ import annotations
 
 import logging
+import sys
 from enum import Enum
 from pathlib import Path
 from typing import Annotated
@@ -93,6 +94,21 @@ def root(
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
+def _require_torch() -> None:
+    """Fail with a plain message when PyTorch cannot load, instead of a traceback."""
+    try:
+        import torch  # noqa: F401
+    except OSError as exc:  # a missing DLL on Windows
+        hint = (
+            "Install the Microsoft Visual C++ runtime from "
+            "https://aka.ms/vs/17/release/vc_redist.x64.exe, then run baton again."
+            if sys.platform == "win32"
+            else "Reinstall Baton."
+        )
+        typer.echo(f"baton: PyTorch cannot load: {exc}\n{hint}", err=True)
+        raise typer.Exit(1) from None
+
+
 @app.command(name="app")
 def open_app(
     name: Annotated[
@@ -110,6 +126,7 @@ def open_app(
     import asyncio
     import contextlib
 
+    _require_torch()
     from baton.agent import run_agent
 
     with contextlib.suppress(KeyboardInterrupt, asyncio.CancelledError):
@@ -164,6 +181,7 @@ def worker(
     """Join the cluster and serve a layer range (PRD 6.1)."""
     if no_mdns and head is None:
         raise typer.BadParameter("--no-mdns needs --head HOST[:PORT]")
+    _require_torch()
     from baton.worker.daemon import WorkerConfig, run_worker
 
     config = WorkerConfig(
@@ -227,6 +245,7 @@ def serve(
     """Run the head, plan the cluster, load the model (PRD 7.1)."""
     import asyncio
 
+    _require_torch()
     from baton.head import serve as head
 
     options = head.ServeOptions(
