@@ -13,7 +13,10 @@ $source = if ($env:BATON_SOURCE) { $env:BATON_SOURCE } else { "https://github.co
 
 if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
     Write-Host "baton: installing uv, which brings its own Python"
-    irm https://astral.sh/uv/install.ps1 | iex
+    # A fresh Windows has the Restricted execution policy, which blocks uv's installer.
+    # Bypass applies to this one child process only. Nothing is changed for the user.
+    powershell -ExecutionPolicy Bypass -c "irm https://astral.sh/uv/install.ps1 | iex"
+    if ($LASTEXITCODE -ne 0) { throw "baton: the uv install failed" }
     $env:Path = "$env:USERPROFILE\.local\bin;$env:Path"
 }
 
