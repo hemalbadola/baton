@@ -87,6 +87,17 @@ _ES_CONTINUOUS = 0x80000000
 _ES_SYSTEM_REQUIRED = 0x00000001
 
 
+def _cache_name(model: object) -> str:
+    """A repo id as it is. A checkpoint directory by its name, never by its path:
+    a path would escape the cache root."""
+    text = str(model)
+    return (
+        text
+        if "/" in text and not Path(text).is_absolute() and ".." not in text
+        else Path(text).name
+    )
+
+
 class Rejected(Exception):
     """The head refused `hello`. `code` says why: `auth`, `name_in_use`, `bad_hello`."""
 
@@ -541,6 +552,7 @@ class WorkerDaemon:
             progress[:] = step
 
         from baton.model import safetensors_io as sio
+        from baton.model.cache import BlobCache
         from baton.model.spec import ModelSpec
         from baton.worker.engine import ForwardEngine, KVPool, ShardTooLarge, load_shard
 
@@ -572,7 +584,17 @@ class WorkerDaemon:
                 first, last = (int(layer) for layer in msg["range"])
                 spec = ModelSpec(**msg["spec"])
                 dtype = torch_dtype(self.caps.compute_dtype)
-                source = sio.open_source(str(msg["model"]), msg.get("hf_token"))
+                url = str(msg.get("source_url") or "")
+                if url:  # the head holds the files (BAT-43)
+                    source = sio.RangeSource(url)
+                else:
+                    source = sio.open_source(str(msg["model"]), msg.get("hf_token"))
+                cache = None
+                # No copy for a local checkpoint, or beside a head on this machine.
+                if isinstance(source, sio.RangeSource) and "//127.0.0.1" not in url:
+                    cache = BlobCache(
+                        self.config.cache_dir, _cache_name(msg["model"]), "main", source
+                    )
                 stack, resident = await asyncio.to_thread(
                     load_shard,
                     spec,
@@ -587,6 +609,7 @@ class WorkerDaemon:
                     dtype=dtype,
                     budget_bytes=self.budget.usable_bytes,
                     on_progress=on_progress,
+                    cache=cache,
                 )
                 self.stack, self.resident_bytes = stack, resident
                 self._next_addr = str(msg["next_node"])
@@ -633,7 +656,7 @@ class WorkerDaemon:
                     "rev": rev,
                     "resident_bytes": resident,
                     "seconds": time.perf_counter() - started,
-                    "from_cache": False,
+                    "from_cache": cache is not None and cache.fetched_bytes == 0,
                 }
             )
 

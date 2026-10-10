@@ -96,9 +96,13 @@ def test_a_name_missing_from_the_index_is_reported(tiny_checkpoint) -> None:
         )
 
 
-def test_no_read_is_larger_than_one_tensor(tiny_checkpoint) -> None:
+def test_no_read_is_larger_than_the_span_cap(tiny_checkpoint, monkeypatch) -> None:
     """BAT-22. Tensors sit back to back in the file. One merged read of the whole
-    range would sit in memory beside the stack and double the peak."""
+    range would sit in memory beside the stack and double the peak. Reads merge
+    only up to the span cap: one request costs a second, so one per tensor made
+    a 1 GB model take five minutes (BAT-11)."""
+    from baton.model import cache
+
     directory, spec, _ = tiny_checkpoint
     reads: list[int] = []
 
@@ -109,7 +113,9 @@ def test_no_read_is_larger_than_one_tensor(tiny_checkpoint) -> None:
 
     index = _index(directory)
     header, header_len = sio.read_header(directory / "model.safetensors")
-    largest = max(ref.nbytes for ref in sio.refs_from_header("f", header, header_len).values())
+    refs = sio.refs_from_header("f", header, header_len).values()
+    largest = max(ref.nbytes for ref in refs)
+    monkeypatch.setattr(cache, "FETCH_SPAN_BYTES", largest)
     load_shard(
         spec,
         0,
@@ -123,3 +129,4 @@ def test_no_read_is_larger_than_one_tensor(tiny_checkpoint) -> None:
         dtype=torch.float32,
     )
     assert max(reads) <= max(largest, 8 + header_len)
+    assert len(reads) - 2 < len(refs)  # two header reads, then fewer reads than tensors

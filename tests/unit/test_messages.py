@@ -94,7 +94,7 @@ def test_load_carries_the_6_4_fields_plus_spec_index_and_headers():
             "headers",
         }
     )
-    assert Load.__optional_keys__ == frozenset({"hf_token"})
+    assert Load.__optional_keys__ == frozenset({"hf_token", "source_url"})
 
 
 def test_a_typed_dict_is_a_plain_dict_and_survives_a_frame():

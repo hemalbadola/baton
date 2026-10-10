@@ -48,7 +48,7 @@ async def until(done, timeout=20.0) -> None:
 
 
 @contextlib.asynccontextmanager
-async def laptop(name: str):
+async def laptop(name: str, head_http: int = 7700):
     ran: list[list[str]] = []
 
     async def spawn(argv):
@@ -56,7 +56,7 @@ async def laptop(name: str):
         return FakeProc()
 
     port = free_port()
-    agent = Agent(name, port, spawn=spawn)
+    agent = Agent(name, port, spawn=spawn, head_http=head_http)
     server = uvicorn.Server(
         uvicorn.Config(agent.app(), host="0.0.0.0", port=port, log_level="error")
     )
@@ -131,3 +131,92 @@ async def test_an_invite_only_comes_from_the_room_that_created_it() -> None:
         r = await http.post(f"{a_url}/api/invite", json={"peer": "beta"})
         assert r.status_code == 400  # no room yet
         assert a.state == "idle"
+
+
+@contextlib.asynccontextmanager
+async def fake_head():
+    """Answers a chat the way the head does: three SSE chunks, then the timing chunk."""
+    from fastapi import FastAPI
+    from fastapi.responses import StreamingResponse
+
+    app = FastAPI()
+
+    @app.post("/v1/chat/completions")
+    async def chat() -> StreamingResponse:
+        async def events():
+            for word in ("Par", "is", "."):
+                yield f'data: {{"choices":[{{"delta":{{"content":"{word}"}}}}]}}\n\n'
+            yield 'data: {"choices":[{"delta":{"content":""}}],"x_baton":{"decode_tok_s":20.0,"ttft_ms":100}}\n\n'
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(events(), media_type="text/event-stream")
+
+    port = free_port()
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error"))
+    server.install_signal_handlers = lambda: None
+    task = asyncio.create_task(server.serve())
+    while not server.started:
+        await asyncio.sleep(0.05)
+    try:
+        yield port
+    finally:
+        server.should_exit = True
+        await task
+
+
+async def test_every_laptop_shows_the_same_conversation() -> None:
+    ask = {"model": "x", "stream": True, "messages": [{"role": "user", "content": "Capital?"}]}
+    async with (
+        fake_head() as head_port,
+        laptop("alpha", head_port) as (a, _, a_url),
+        laptop("beta") as (_b, _, b_url),
+        httpx.AsyncClient(timeout=10) as http,
+    ):
+
+        async def sees_beta() -> bool:
+            return "beta" in [p["name"] for p in (await http.get(f"{a_url}/api/peers")).json()]
+
+        await until(sees_beta)
+        await http.post(f"{a_url}/api/room", json={"model": "Qwen/x"})
+        await http.post(f"{a_url}/api/invite", json={"peer": "beta"})
+        invite = (await http.get(f"{b_url}/api/me")).json()["invites"][0]["id"]
+        await http.post(f"{b_url}/api/accept", json={"id": invite})
+        await http.post(f"{a_url}/api/start")
+
+        # The guest asks. Its request goes through the host, which keeps the conversation.
+        reply = await http.post(f"{b_url}/v1/chat/completions", json=ask)
+        assert reply.status_code == 200 and "Par" in reply.text
+
+        want = [
+            {"role": "user", "content": "Capital?", "by": "beta"},
+            {
+                "role": "assistant",
+                "content": "Paris.",
+                "done": True,
+                "tok_s": 20.0,
+                "ttft_ms": 100,
+            },
+        ]
+        assert a.transcript == want
+        assert (await http.get(f"{a_url}/api/transcript")).json() == want
+        assert (await http.get(f"{b_url}/api/transcript")).json() == want
+
+        await http.post(f"{a_url}/api/stop")
+        assert a.transcript == []
+
+
+async def test_another_laptop_cannot_click_for_the_user() -> None:
+    """Accept, Start and Stop are the user's clicks. They must come from the page
+    on this laptop, never from the network."""
+    from baton.common.net import lan_addresses
+
+    lan = lan_addresses()[0]
+    if lan.startswith("127."):
+        return  # no network: every address is loopback
+    async with laptop("alpha") as (a, ran, a_url), httpx.AsyncClient(timeout=10) as http:
+        remote = a_url.replace("127.0.0.1", lan)
+        for path in ("room", "invite", "start", "stop", "accept", "decline"):
+            r = await http.post(f"{remote}/api/{path}", json={"model": "x", "id": "y", "peer": "z"})
+            assert r.status_code == 403, path
+        assert a.state == "idle" and not ran
+        assert (await http.get(f"{remote}/api/me")).status_code == 200  # peers may look

@@ -16,6 +16,7 @@ import torch
 from baton.worker.sampler import Sampler, SamplingParams
 
 if TYPE_CHECKING:  # imported for types only
+    from baton.model.cache import BlobCache
     from baton.model.layers import DecoderStack
     from baton.model.safetensors_io import ByteSource
     from baton.model.spec import ModelSpec
@@ -61,6 +62,7 @@ def load_shard(
     dtype: torch.dtype,
     budget_bytes: int | None = None,
     on_progress: Callable[[int, int, int], None] | None = None,
+    cache: BlobCache | None = None,
 ) -> tuple[DecoderStack, int]:
     """Fetch one layer range and build the resident stack (PRD 5.3, 6.4 steps 2-3).
 
@@ -73,18 +75,21 @@ def load_shard(
     tensor. The size is checked against `budget_bytes` before anything is
     allocated, because a laptop that swaps is worse than one that says no.
 
-    ponytail: dense weights in the compute dtype, fetched on every load. The
-    quantized tiers are BAT-10; the shard cache and the memmapped embedding
-    table are BAT-11.
+    With `cache`, a tensor already on disk is not fetched again (BAT-11).
+
+    ponytail: dense weights in the compute dtype. The quantized tiers are
+    BAT-10. The embedding table is resident, not memmapped.
     """
     from baton.model import safetensors_io as sio
+    from baton.model.cache import FETCH_SPAN_BYTES
     from baton.model.layers import DecoderStack
 
     names = spec.range_names(first_layer, last_layer + 1, embed=embed, head=head)
     missing = [name for name in names if name not in index]
     if missing:
         raise KeyError(f"index names no file for {missing[0]!r} ({len(missing)} missing)")
-    headers = {file: sio.fetch_header(source, file) for file in sorted({index[n] for n in names})}
+    read_header = cache.header if cache is not None else lambda f: sio.fetch_header(source, f)
+    headers = {file: read_header(file) for file in sorted({index[n] for n in names})}
     refs = sio.resolve(index, headers, names)
 
     need = sum(ref.numel() for ref in refs) * torch.empty((), dtype=dtype).element_size()
@@ -108,10 +113,14 @@ def load_shard(
 
     done = fetched = 0
     with torch.no_grad():
-        # `max_gap=-1` turns coalescing off. Tensors sit back to back in a shard
-        # file, so any gap allowance merges the whole layer range into one
-        # multi-GB read held beside the stack (PRD 5.3 step 5).
-        for name, tensor in sio.iter_tensors(refs, source, max_gap=-1):
+        # Tensors sit back to back in a shard file. The span cap stops the whole
+        # layer range from merging into one multi-GB read held beside the stack
+        # (PRD 5.3 step 5).
+        if cache is not None:
+            tensors = cache.iter_tensors(refs)
+        else:
+            tensors = sio.iter_tensors(refs, source, max_gap=0, max_span=FETCH_SPAN_BYTES)
+        for name, tensor in tensors:
             for slot in slots[name]:
                 # `copy_` broadcasts, so a wrong-shaped tensor would load silently.
                 if slot.shape != tensor.shape:

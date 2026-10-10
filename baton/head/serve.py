@@ -234,6 +234,11 @@ class Head:
     _last_join: float = field(default=0.0, repr=False)
     _errors: dict[str, str] = field(default_factory=dict, repr=False)
     _progress: dict[str, int] = field(default_factory=dict, repr=False)
+    weights: Any = field(default=None, repr=False)
+    """`WeightStore`: the model's files on this disk. None without the HTTP server."""
+
+    _app: Any = field(default=None, repr=False)
+    _download: asyncio.Task[None] | None = field(default=None, repr=False)
     _http: Any = field(default=None, repr=False)
     _tasks: set[asyncio.Task[None]] = field(default_factory=set, repr=False)
     events: list[dict[str, Any]] = field(default_factory=list, repr=False)
@@ -258,6 +263,7 @@ class Head:
             if not self.options.no_local_worker:
                 await self.spawn_local_worker()
             self.metadata = await self.fetch_metadata()
+            self.start_download()
             self.state = "idle"
             while True:
                 await self.wait_for_workers()
@@ -298,7 +304,7 @@ class Head:
 
         dist = Path(__file__).resolve().parents[2] / "dashboard" / "dist"
         mount = str(dist) if self.options.dashboard and dist.is_dir() else None
-        app = create_app(ClusterApi(self), mount)
+        self._app = app = create_app(ClusterApi(self), mount)
         config = uvicorn.Config(app, host="0.0.0.0", port=self.options.port, log_level="warning")
         self._http = uvicorn.Server(config)
         self._http.install_signal_handlers = lambda: None  # `serve` owns SIGTERM
@@ -361,6 +367,22 @@ class Head:
         meta.eos_ids = eos_ids(meta.config, meta.tokenizer)
         return meta
 
+    def start_download(self) -> None:
+        """Step 4, second half: put the model's files on this disk (BAT-43).
+
+        It runs while the workers join and are benchmarked. The workers then
+        fetch their layers from this head, not from Hugging Face.
+        """
+        if self._app is None:
+            return  # no HTTP server: each worker opens the model itself
+        from baton.head.weights import WeightStore
+
+        assert self.metadata is not None
+        o = self.options
+        self.weights = WeightStore(o.model, self.metadata.shard_headers, o.hf_token, o.revision)
+        self._app.state.weights = self.weights
+        self._download = asyncio.create_task(self.weights.ensure(self.echo))
+
     async def wait_for_workers(self) -> None:
         """Step 5. Wait for the fleet, then print the roster.
 
@@ -394,6 +416,15 @@ class Head:
         if not self.plan.feasible:
             return False
         self.state = "loading"
+        if self._download is not None:
+            try:
+                await self._download
+            except RuntimeError as exc:
+                self.echo(str(exc))
+                self.event("error", str(exc))
+                self._download = asyncio.create_task(self.weights.ensure(self.echo))  # next try
+                self.state = "idle"
+                return False
         if not await self.load_plan(self.plan):
             self.state = "idle"
             return False
@@ -563,6 +594,10 @@ class Head:
             }
             if o.hf_token:
                 frame["hf_token"] = o.hf_token
+            if self.weights is not None:
+                # This head, at the address the worker already reaches it on.
+                host = worker.control.get_extra_info("sockname")[0]
+                frame["source_url"] = f"http://{format_addr(host, o.port)}/weights"
             await self._send(worker, frame)
 
         def states() -> list[str]:
@@ -604,6 +639,8 @@ class Head:
         """Stop advertising, close every socket, stop the local worker."""
         if self._sweeper is not None:
             self._sweeper.cancel()
+        if self._download is not None:
+            self._download.cancel()
         if self._http is not None:
             self._http.should_exit = True
             await asyncio.gather(*self._tasks, return_exceptions=True)
@@ -794,6 +831,7 @@ class Head:
                     self.echo(
                         f"  {name}: loaded {int(frame['resident_bytes']) / 1024**2:.0f} MB "
                         f"in {float(frame['seconds']):.1f} s"
+                        + (" from the disk cache" if frame.get("from_cache") else "")
                     )
             # A load error names its plan revision. One from an old plan must
             # not fail the plan that replaced it.

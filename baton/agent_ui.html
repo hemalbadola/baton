@@ -117,8 +117,7 @@ details pre { margin:8px 0 0; padding:10px; background:#0f1115; border-radius:8p
 const $ = id => document.getElementById(id);
 const show = (id, on) => $(id).hidden = !on;
 const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
-let me = null, peers = [], cluster = null, busy = false;
-const history = [];
+let me = null, peers = [], cluster = null, busy = false, transcript = [];
 
 async function call(path, body) {
   const res = await fetch(path, body === undefined ? {} : {
@@ -181,7 +180,10 @@ function render() {
   if (running) {
     $("cluster-title").textContent = me.state === "hosting" ? "Your cluster" : `Joined ${me.joined ? me.joined.host : ""}`;
     const c = cluster;
-    $("cluster-line").textContent = !c ? "Starting. The first start downloads the model, which takes a few minutes."
+    // Before the cluster is ready, the last line of the log says what it waits for.
+    const waiting = (me.log[me.log.length - 1] || "").trim();
+    $("cluster-line").textContent = !c ? "Starting. The first start downloads the model once."
+      : c.state !== "READY" && c.state !== "SERVING" ? `${c.state} · ${waiting}`
       : `${c.state} · ${c.model ? c.model.id : ""} · ${c.live.tok_s.toFixed(1)} tok/s · first token ${Math.round(c.live.ttft_ms)} ms`;
     show("nodes", !!c && c.nodes.length > 0);
     if (c) $("nodes").querySelector("tbody").innerHTML = c.nodes.map(n => `<tr>
@@ -202,50 +204,49 @@ document.addEventListener("click", e => {
 $("host").onclick = () => act("/api/room", {model: $("model").value, spread: $("spread").checked});
 $("start").onclick = () => act("/api/start", {});
 $("cancel").onclick = () => act("/api/stop", {});
-$("stop").onclick = () => { history.length = 0; $("transcript").innerHTML = ""; act("/api/stop", {}); };
+$("stop").onclick = () => { shown = ""; $("transcript").innerHTML = ""; act("/api/stop", {}); };
+
+// One conversation for the whole room. The host keeps it, every laptop shows it.
+let shown = "";
+async function refreshChat() {
+  if (!me || (me.state !== "hosting" && me.state !== "joined")) return;
+  let lines;
+  try { lines = await call("/api/transcript"); } catch (e) { return; }
+  transcript = lines;
+  const key = JSON.stringify(lines);
+  if (key === shown) return;
+  shown = key;
+  const box = $("transcript"), pinned = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+  box.innerHTML = lines.map(m => {
+    const who = m.role === "user" ? esc(m.by || "user") : "baton";
+    const stats = m.tok_s ? `<div class="muted">${m.tok_s.toFixed(1)} tok/s · first token ${Math.round(m.ttft_ms)} ms</div>` : "";
+    const error = m.error ? `<div style="color:var(--bad)">Error: ${esc(m.error)}</div>` : "";
+    return `<div class="msg ${m.role}"><div class="muted">${who}</div>${esc(m.content)}${m.role === "assistant" && !m.done ? " ▍" : ""}${error}${stats}</div>`;
+  }).join("");
+  if (pinned) box.scrollTop = 1e9;
+}
 
 $("compose").onsubmit = async e => {
   e.preventDefault();
   const content = $("text").value.trim();
   if (!content || busy) return;
   busy = true; $("send").disabled = true; $("text").value = "";
-  history.push({role: "user", content});
-  const add = (role, text) => {
-    const d = document.createElement("div"); d.className = "msg " + role; d.textContent = text;
-    $("transcript").appendChild(d); $("transcript").scrollTop = 1e9; return d;
-  };
-  add("user", content);
-  const box = add("assistant", "");
-  let reply = "";
+  const messages = transcript.filter(m => m.content && !m.error && (m.role === "user" || m.done))
+    .map(m => ({role: m.role, content: m.content}));
+  messages.push({role: "user", content});
   try {
     const res = await fetch("/v1/chat/completions", {method: "POST",
       headers: {"content-type": "application/json"},
-      body: JSON.stringify({model: "baton", stream: true, messages: history})});
+      body: JSON.stringify({model: "baton", stream: true, messages})});
     if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error?.message || `HTTP ${res.status}`);
-    const reader = res.body.getReader(), dec = new TextDecoder();
-    let buf = "";
-    for (;;) {
-      const {value, done} = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, {stream: true});
-      const parts = buf.split("\n\n"); buf = parts.pop();
-      for (const part of parts) {
-        const data = part.replace(/^data: /, "");
-        if (!data || data === "[DONE]") continue;
-        const chunk = JSON.parse(data);
-        if (chunk.error) throw new Error(chunk.error.message);
-        reply += chunk.choices[0].delta?.content ?? "";
-        box.textContent = reply;
-        if (chunk.x_baton) box.textContent += `\n\n${chunk.x_baton.decode_tok_s.toFixed(1)} tok/s · first token ${Math.round(chunk.x_baton.ttft_ms)} ms`;
-      }
-    }
-    history.push({role: "assistant", content: reply});
-  } catch (err) {
-    history.pop();
-    box.textContent = "Error: " + err.message;
-  } finally { busy = false; $("send").disabled = false; $("text").focus(); }
+    // The text shows up through the shared conversation. This only keeps the request open.
+    const reader = res.body.getReader();
+    while (!(await reader.read()).done) { /* drain */ }
+  } catch (err) { fail(err); }
+  finally { busy = false; $("send").disabled = false; $("text").focus(); }
 };
 
+setInterval(refreshChat, 400);
 refresh();
 setInterval(refresh, 1500);
 </script>

@@ -203,6 +203,7 @@ class Load(TypedDict):
     index: dict[str, str]
     headers: dict[str, str]
     hf_token: NotRequired[str]
+    source_url: NotRequired[str]  # the head's `/weights`. Absent: open `model` directly.
 
 
 class Unload(TypedDict):

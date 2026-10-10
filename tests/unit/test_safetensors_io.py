@@ -168,6 +168,17 @@ def test_different_files_never_merge():
     assert {s.file for s in spans} == {"f1", "f2"}
 
 
+def test_coalesce_stops_a_span_at_the_cap():
+    refs = [ref(n, "f", i * 100, (i + 1) * 100) for i, n in enumerate("abcde")]
+    spans = sio.coalesce(refs, max_gap=0, max_span=250)
+    assert [(s.start, s.end) for s in spans] == [(0, 200), (200, 400), (400, 500)]
+
+
+def test_coalesce_keeps_one_tensor_over_the_cap_whole():
+    spans = sio.coalesce([ref("a", "f", 0, 1000), ref("b", "f", 1000, 1010)], 0, max_span=100)
+    assert [(s.start, s.end) for s in spans] == [(0, 1000), (1000, 1010)]
+
+
 def test_coalesce_sorts_out_of_order_input():
     spans = sio.coalesce([ref("b", "f", 100, 200), ref("a", "f", 0, 100)])
     assert [r.name for r in spans[0].refs] == ["a", "b"]
@@ -242,9 +253,11 @@ def test_shape_that_disagrees_with_the_byte_range_raises():
 
 
 class FakeResponse:
-    def __init__(self, status_code, content):
+    def __init__(self, status_code, content, headers=None, history=()):
         self.status_code = status_code
         self.content = content
+        self.headers = headers or {}
+        self.history = history
 
 
 class FakeClient:
@@ -373,3 +386,17 @@ def test_index_json_shape_is_what_resolve_expects(tmp_path):
     index = json.loads(json.dumps({"metadata": {}, "weight_map": {"x": "a.safetensors"}}))
     refs = sio.resolve(index["weight_map"], _headers(tmp_path, "a.safetensors"), ["x"])
     assert refs[0].name == "x"
+
+
+def test_range_source_learns_the_commit_from_the_redirect():
+    """Hugging Face names the commit on the redirect, not on the CDN reply (BAT-11)."""
+
+    class Redirecting(FakeClient):
+        def get(self, url, headers):
+            reply = super().get(url, headers)
+            reply.history = (FakeResponse(307, b"", {"x-repo-commit": "abc123"}),)
+            return reply
+
+    src = sio.RangeSource("https://h/r/resolve/main", client=Redirecting(bytes(64)))
+    src.fetch("f", 0, 8)
+    assert src.commit == "abc123"

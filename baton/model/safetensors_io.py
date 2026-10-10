@@ -188,17 +188,26 @@ class ByteRange:
         return self.end - self.start
 
 
-def coalesce(refs: Sequence[TensorRef], max_gap: int = COALESCE_GAP) -> list[ByteRange]:
+def coalesce(
+    refs: Sequence[TensorRef], max_gap: int = COALESCE_GAP, max_span: int | None = None
+) -> list[ByteRange]:
     """Group refs of the same file into fetches, merging gaps under ``max_gap``.
 
     A 70B layer's nine tensors usually sit in one file and merge into one or two
-    requests (PRD 12.1).
+    requests (PRD 12.1). ``max_span`` caps the bytes of one fetch, because the
+    span is held in memory beside the model. One tensor larger than the cap is
+    still one fetch.
     """
     ordered = sorted(refs, key=lambda r: (r.file, r.start, r.end))
     out: list[ByteRange] = []
     group: list[TensorRef] = []
     for ref in ordered:
-        if group and ref.file == group[0].file and ref.start - group[-1].end <= max_gap:
+        if (
+            group
+            and ref.file == group[0].file
+            and ref.start - group[-1].end <= max_gap
+            and (max_span is None or ref.end - group[0].start <= max_span)
+        ):
             group.append(ref)
             continue
         if group:
@@ -268,6 +277,9 @@ class RangeSource:
         self._timeout = timeout
         self._client = client
         self._owned = client is None
+        self.commit: str | None = None
+        """The repo commit behind the revision, learned from the first response.
+        Hugging Face names it on the redirect. The shard cache keys on it."""
 
     @property
     def client(self):
@@ -298,6 +310,8 @@ class RangeSource:
         for attempt in range(self.retries):
             try:
                 resp = self.client.get(url, headers=headers)
+                for hop in (*resp.history, resp):
+                    self.commit = hop.headers.get("x-repo-commit") or self.commit
                 if resp.status_code not in (200, 206):
                     raise SafetensorsError(f"{url}: HTTP {resp.status_code}")
                 blob = resp.content
@@ -365,13 +379,14 @@ def iter_tensors(
     source: ByteSource,
     max_gap: int = COALESCE_GAP,
     verify: bool = True,
+    max_span: int | None = None,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Stream the given tensors, one at a time, in file order.
 
     One span is held at a time, so peak host memory is one coalesced fetch. The
     caller quantizes and frees each tensor before the next arrives (PRD 5.3 step 5).
     """
-    for span in coalesce(refs, max_gap):
+    for span in coalesce(refs, max_gap, max_span):
         blob = source.fetch(span.file, span.start, span.end)
         for ref in span.refs:
             tensor = slice_tensor(blob, span.start, ref)

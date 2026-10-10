@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Annotated, Any, Literal, Protocol
 
 from fastapi import APIRouter, FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -307,6 +308,25 @@ async def _complete(
     return StreamingResponse(events(), media_type="text/event-stream")
 
 
+@router.get("/weights/{file:path}")
+async def weights(file: str, request: Request) -> Response:
+    """One byte range of one shard file, for a worker (PRD 12.2). The head holds
+    the files, so a worker needs no route to Hugging Face."""
+    store = request.app.state.weights
+    span = re.fullmatch(r"bytes=(\d+)-(\d+)", request.headers.get("range", ""))
+    if store is None or not store.ready:
+        return Response(status_code=503)
+    if span is None:
+        return Response(status_code=416)
+    start, last = int(span[1]), int(span[2])
+    try:
+        blob = await asyncio.to_thread(store.read, file, start, last + 1)
+    except (KeyError, OSError):
+        return Response(status_code=404)
+    headers = {"content-range": f"bytes {start}-{last}/*", "x-repo-commit": store.commit or ""}
+    return Response(blob, 206, headers, "application/octet-stream")
+
+
 @router.get("/healthz", response_model=HealthResponse)
 async def healthz(request: Request) -> JSONResponse:
     """200 when READY or SERVING, 503 otherwise (13.1)."""
@@ -542,6 +562,7 @@ def create_app(driver: HeadSeam | None = None, dashboard_dist: str | None = None
     """
     app = FastAPI(title="baton", docs_url=None, redoc_url=None)
     app.state.driver = driver
+    app.state.weights = None  # `baton.head.serve` sets it once the metadata is read
     app.include_router(router)
 
     @app.exception_handler(BatonError)

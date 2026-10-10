@@ -66,3 +66,16 @@ def test_worker_without_mdns_needs_a_head():
 def test_required_model_flag():
     result = runner.invoke(app, ["serve"])
     assert result.exit_code != 0
+
+
+def test_the_page_reads_the_same_under_a_non_utf8_locale():
+    """Windows defaults to cp1252. The page showed `0â€“14` for `0–14` there."""
+    import os
+    import subprocess
+    import sys
+
+    env = os.environ | {"LC_ALL": "C", "PYTHONUTF8": "0", "PYTHONCOERCECLOCALE": "0"}
+    code = "import sys; from baton.agent import page_html; sys.stdout.buffer.write(page_html().encode())"
+    out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, check=True)
+    assert "–".encode() in out.stdout and "·".encode() in out.stdout
+    assert "â€".encode() not in out.stdout

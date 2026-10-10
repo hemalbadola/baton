@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import secrets
 import socket
 import sys
@@ -46,6 +47,12 @@ MODELS = [
 ]
 
 Spawn = Callable[[list[str]], Coroutine[Any, Any, Any]]
+
+
+def page_html() -> str:
+    """The page. Read as UTF-8 by name: the default on Windows is cp1252, which
+    turned every dash and dot separator into `â€“` and `Â·`."""
+    return Path(__file__).with_name("agent_ui.html").read_text(encoding="utf-8")
 
 
 @dataclass
@@ -96,6 +103,8 @@ class Agent:
         self.joined_invite: Invite | None = None
         self.peers: dict[str, dict[str, Any]] = {}  # mDNS service name -> {name, addrs}
         self.log: deque[str] = deque(maxlen=300)
+        self.transcript: list[dict[str, Any]] = []
+        """The room's one conversation, kept on the host. Every laptop shows it."""
         self._spawn = spawn or self._spawn_process
         self._proc: Any = None
         self._watch: asyncio.Task[None] | None = None
@@ -243,19 +252,52 @@ class Agent:
         if self.state == "hosting":
             return f"http://127.0.0.1:{self.head_http}"
         if self.state == "joined" and self.joined_invite is not None:
-            return f"http://{self.joined_invite.host_ip}:{self.head_http}"
+            # Through the host's agent, not straight to the head: the host keeps
+            # the shared conversation.
+            return f"http://{self.joined_invite.from_addr}"
         return None
+
+    def _record(self, entry: dict[str, Any], data: bytes) -> bytes:
+        """Copy what the head streams into the shared conversation. Returns the
+        bytes of an event that is not complete yet."""
+        *events, rest = data.split(b"\n\n")
+        for event in events:
+            text = event.decode(errors="replace").removeprefix("data: ")
+            if not text.startswith("{"):
+                continue
+            try:
+                chunk = json.loads(text)
+            except ValueError:
+                continue
+            if "error" in chunk:
+                entry["error"] = str(chunk["error"].get("message", chunk["error"]))
+                continue
+            choice = (chunk.get("choices") or [{}])[0]
+            entry["content"] += (choice.get("delta") or choice.get("message") or {}).get(
+                "content"
+            ) or ""
+            if "x_baton" in chunk:
+                entry["tok_s"] = chunk["x_baton"].get("decode_tok_s")
+                entry["ttft_ms"] = chunk["x_baton"].get("ttft_ms")
+        return rest
 
     def app(self) -> FastAPI:
         api = FastAPI(docs_url=None, redoc_url=None)
-        page = Path(__file__).with_name("agent_ui.html")
 
         def bad(message: str, status: int = 400) -> JSONResponse:
             return JSONResponse({"error": message}, status_code=status)
 
+        def by_user(request: Request) -> bool:
+            """True when the call comes from this laptop's own page. A click is the
+            user's decision, so no other laptop may send one."""
+            return request.client is not None and request.client.host in ("127.0.0.1", "::1")
+
+        def denied() -> JSONResponse:
+            return JSONResponse({"error": "only this laptop's own page can do that"}, 403)
+
         @api.get("/", response_class=HTMLResponse)
         async def index() -> str:
-            return page.read_text()
+            return page_html()
 
         @api.get("/api/me")
         async def me() -> dict[str, Any]:
@@ -268,7 +310,9 @@ class Agent:
         # -- host --
 
         @api.post("/api/room")
-        async def create_room(body: dict[str, Any]) -> Any:
+        async def create_room(body: dict[str, Any], request: Request) -> Any:
+            if not by_user(request):
+                return denied()
             if self.state not in ("idle", "lobby"):
                 return bad(f"this laptop is {self.state}")
             model = str(body.get("model", "")).strip()
@@ -279,7 +323,9 @@ class Agent:
             return {"ok": True}
 
         @api.post("/api/invite")
-        async def invite(body: dict[str, Any]) -> Any:
+        async def invite(body: dict[str, Any], request: Request) -> Any:
+            if not by_user(request):
+                return denied()
             if self.state != "lobby" or self.room is None:
                 return bad("create a room first")
             peers = {p["name"]: p for p in await self.nearby()}
@@ -315,7 +361,9 @@ class Agent:
             return {"ok": True}
 
         @api.post("/api/start")
-        async def start() -> Any:
+        async def start(request: Request) -> Any:
+            if not by_user(request):
+                return denied()
             if self.state != "lobby" or self.room is None:
                 return bad("create a room first")
             room = self.room
@@ -351,8 +399,11 @@ class Agent:
             return {"ok": True}
 
         @api.post("/api/stop")
-        async def stop() -> Any:
+        async def stop(request: Request) -> Any:
+            if not by_user(request):
+                return denied()
             room, self.room = self.room, None
+            self.transcript = []
             invite, self.joined_invite = self.joined_invite, None
             await self._stop_process()
             self.state = "idle"
@@ -386,7 +437,9 @@ class Agent:
             return {"ok": True}
 
         @api.post("/api/accept")
-        async def accept(body: dict[str, Any]) -> Any:
+        async def accept(body: dict[str, Any], request: Request) -> Any:
+            if not by_user(request):
+                return denied()
             invite = self.invites.get(str(body.get("id")))
             if invite is None or invite.status != "pending":
                 return bad("no such invite", 404)
@@ -405,7 +458,9 @@ class Agent:
             return {"ok": True}
 
         @api.post("/api/decline")
-        async def decline(body: dict[str, Any]) -> Any:
+        async def decline(body: dict[str, Any], request: Request) -> Any:
+            if not by_user(request):
+                return denied()
             invite = self.invites.get(str(body.get("id")))
             if invite is not None:
                 invite.status = "declined"
@@ -442,6 +497,18 @@ class Agent:
             self.state = "idle"
             return {"ok": True}
 
+        @api.get("/api/transcript")
+        async def transcript() -> Any:
+            """The room's conversation. A guest asks the host for it."""
+            if self.state == "joined" and self.joined_invite is not None:
+                try:
+                    async with httpx.AsyncClient(timeout=3) as client:
+                        url = f"http://{self.joined_invite.from_addr}/api/transcript"
+                        return (await client.get(url)).json()
+                except (httpx.HTTPError, ValueError):
+                    return []
+            return self.transcript
+
         # -- the cluster's own API, so the page needs no second port --
 
         async def proxy(request: Request, path: str) -> Any:
@@ -450,26 +517,46 @@ class Agent:
                 return JSONResponse(
                     {"error": {"message": "no cluster yet", "code": "not_ready"}}, 503
                 )
+            content = await request.body()
+            sender = request.headers.get("x-baton-from") or self.name
+            entry: dict[str, Any] | None = None
+            if self.state == "hosting" and path == "/v1/chat/completions":
+                with contextlib.suppress(ValueError, KeyError, IndexError, TypeError):
+                    asked = json.loads(content)["messages"][-1]["content"]
+                    self.transcript.append({"role": "user", "content": str(asked), "by": sender})
+                    entry = {"role": "assistant", "content": "", "done": False}
+                    self.transcript.append(entry)
             client = httpx.AsyncClient(timeout=None)
             upstream = client.build_request(
                 request.method,
                 f"{base}{path}",
-                content=await request.body(),
-                headers={"content-type": request.headers.get("content-type", "application/json")},
+                content=content,
+                headers={
+                    "content-type": request.headers.get("content-type", "application/json"),
+                    "x-baton-from": sender,
+                },
             )
             try:
                 response = await client.send(upstream, stream=True)
             except httpx.HTTPError:
                 await client.aclose()
+                if entry is not None:
+                    entry.update(done=True, error="the head does not answer")
                 return JSONResponse(
                     {"error": {"message": "the head does not answer", "code": "not_ready"}}, 503
                 )
 
             async def body() -> Any:
+                held = b""
                 try:
                     async for chunk in response.aiter_raw():
+                        if entry is not None:
+                            held = self._record(entry, held + chunk)
                         yield chunk
                 finally:  # a client that leaves closes the upstream and aborts the ring
+                    if entry is not None:
+                        self._record(entry, held + b"\n\n")  # a plain JSON reply has no blank line
+                        entry["done"] = True
                     await response.aclose()
                     await client.aclose()
 

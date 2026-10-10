@@ -21,7 +21,7 @@ import hashlib
 import json
 import os
 import time
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -315,8 +315,115 @@ class ModelCache:
 
 
 # --------------------------------------------------------------------------- #
+# Dense tensors, as fetched (BAT-11)
+# --------------------------------------------------------------------------- #
+
+FETCH_SPAN_BYTES = 64 << 20
+"""Largest ranged request for tensors that sit back to back. A request costs about
+one second before the first byte, so one request per tensor made a 1 GB model take
+five minutes. The span is held in memory once, beside the model."""
+
+
+class BlobCache:
+    """Keeps every tensor a worker fetched, one file per tensor.
+
+    Layout: ``<root>/models/<repo_id>/<commit>/blobs/<file>/<start>-<end>``, the
+    raw bytes of that range. The key is the tensor, not the layer range, so a
+    new plan with a different range fetches only the tensors it does not have.
+
+    The directory is named by the repo commit, so a checkpoint that changes
+    upstream never mixes with the old bytes. With no network, the last commit
+    seen for the revision is used, and a cached shard loads offline.
+    """
+
+    def __init__(
+        self, root: str | Path, repo_id: str, revision: str, source: sio.ByteSource
+    ) -> None:
+        self.root = Path(root)
+        self.repo_id = repo_id
+        self.revision = revision
+        self.source = source
+        self.commit: str | None = None
+        self.fetched_bytes = 0
+        """Bytes that came from the network in this load. Zero means a full cache hit."""
+
+    @property
+    def _pointer(self) -> Path:
+        return self.root / "models" / self.repo_id / f"{self.revision}.commit"
+
+    def _dir(self) -> Path:
+        assert self.commit is not None
+        return ModelCache(self.repo_id, self.commit, self.root).dir
+
+    def header(self, file: str) -> tuple[dict, int]:
+        """The shard header, from the network when there is one, else from disk."""
+        try:
+            header, header_len = sio.fetch_header(self.source, file)
+        except sio.SafetensorsError:
+            if self.commit is None and self._pointer.exists():
+                self.commit = self._pointer.read_text().strip()
+            path = self._dir() / "headers" / f"{file}.json" if self.commit else None
+            if path is None or not path.exists():
+                raise
+            saved = json.loads(path.read_text())
+            return saved["header"], saved["header_len"]
+        if self.commit is None:
+            # A source that names no commit still gets a stable directory.
+            self.commit = getattr(self.source, "commit", None) or self.revision
+            _try_write(self._pointer, self.commit.encode())
+        _try_write(
+            self._dir() / "headers" / f"{file}.json",
+            json.dumps({"header": header, "header_len": header_len}).encode(),
+        )
+        return header, header_len
+
+    def _blob(self, ref: sio.TensorRef) -> Path:
+        return self._dir() / "blobs" / ref.file / f"{ref.start}-{ref.end}"
+
+    def iter_tensors(
+        self, refs: Sequence[sio.TensorRef], verify: bool = True
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        """Stream the tensors: the cached ones from disk, the rest from the source.
+
+        Call `header` for each file first. That is what learns the commit.
+        """
+        missing: list[sio.TensorRef] = []
+        for ref in refs:
+            path = self._blob(ref)
+            try:
+                hit = path.stat().st_size == ref.nbytes
+            except OSError:
+                hit = False
+            if not hit:
+                missing.append(ref)
+                continue
+            tensor = sio.slice_tensor(path.read_bytes(), ref.start, ref)
+            if verify:
+                sio.check_finite(ref.name, tensor)
+            yield ref.name, tensor
+        for span in sio.coalesce(missing, max_gap=0, max_span=FETCH_SPAN_BYTES):
+            blob = self.source.fetch(span.file, span.start, span.end)
+            self.fetched_bytes += len(blob)
+            for ref in span.refs:
+                tensor = sio.slice_tensor(blob, span.start, ref)
+                if verify:
+                    sio.check_finite(ref.name, tensor)
+                _try_write(self._blob(ref), blob[ref.start - span.start : ref.end - span.start])
+                yield ref.name, tensor
+            del blob
+
+
+# --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+
+
+def _try_write(path: Path, data: bytes) -> None:
+    """Cache one file. A full disk costs the cache, never the load."""
+    try:
+        _atomic_write(path, data)
+    except OSError:
+        path.with_suffix(path.suffix + ".part").unlink(missing_ok=True)
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
